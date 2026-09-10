@@ -192,6 +192,34 @@ Found while writing steps 1 and 2, unranked:
   is four loads and an index round-trip rather than one 16-byte load. Correct,
   just not the load it reads as.
 
+Found while writing steps 3 and 4, unranked:
+
+- **Gap 2 is reachable without the embedding.** The logits buffer is
+  `promptCapacity × 256000 × 4` bytes: 524 MB at the default 512 rows, and
+  2048 rows is past what an `int` describes. `Gemma::prepare` counts it in
+  64 bits and refuses with a `ModelError` naming this gap rather than
+  truncating the allocation. The widened F32 embedding, 2.10 GB, is bound
+  twice — as the gather's table and as the tied logits weight — and sits
+  50 MB under the limit.
+- **`commitAsync` cannot drive a generation loop.** Its `Async` resolves on
+  the main thread, and a loop that never returns to the run loop never sees
+  it — eacp's own header says so. `submit()` and the scoped
+  `CommandBuffer::read`, which waits for that one buffer rather than the
+  newest submission, are what the loop uses, with two steps in flight. Gap 5
+  above stands as written for the demo app's sake, not the loop's.
+- **A host write into a buffer the GPU is still writing is ordered by
+  nothing.** The steps computed past the end of a run are still filling the
+  sequence buffer when the next run's `Buffer::update` copies its prompt in,
+  and nothing in the API says the two are unordered. The loop waits on the
+  ring before it returns; WhisperEACP's `Whisper` carries the same latent
+  race. A `Buffer::update` that waited for in-flight writers, or a documented
+  rule that it does not, belongs in eacp.
+- **No raw-bytes concatenation in the loader.** Fusing gate and up goes through
+  `readFloats`, so an fp16 repo pays a widened copy of the largest weight per
+  layer where a packed stack would have kept it half the size. Costs Gemma's
+  BF16 checkpoint nothing, since it is widened regardless; gone once gap 1
+  lands and the packed read exists. Ours, not eacp's, but decided by gap 1.
+
 Already filled since the Whisper rounds: 3D dispatch exists, so the head no
 longer has to be folded into the dispatch row; `CommandTimer` times
 off-screen command buffers.
@@ -213,15 +241,49 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    switch WhisperEACP carries was dropped: eacp `develop` has it
    unconditionally. Nothing has run against the real checkpoint; every test
    that needs it returns early until `GEMMA_MODEL_DIR` is set.
-3. Prefill of a prompt, logits checked against llama.cpp over the GGUF.
-4. The KV-cached greedy loop, a string in and a string out.
+3. **Built, not yet run.** `Decoder` is the forward pass over a KV cache, one
+   compute pass per step, checked against a double-precision reference over a
+   synthetic checkpoint the tests write (2e-7 relative, asserted at 5e-6),
+   through both the many-row tiled product and the one-row split product,
+   and through a two-shard checkpoint. The llama.cpp comparison exists behind
+   `HF_EACP_ENABLE_LLAMA_CPP` — llama.cpp pinned at `b10900`, every ggml
+   backend off — as `Tests/Oracle`: the tokenizer against llama.cpp's, our
+   prefill and token-by-token logits against its rows, an eight-token greedy
+   continuation, and the config's numbers against the GGUF's header, which is
+   what retires the "confirm every number" caveat above. Every one of them
+   skips until `GEMMA_MODEL_DIR` holds the checkpoint and `gemma-2b.gguf`, so
+   the elementwise tolerance there is provisional and the argmax and top-5
+   agreement is the assertion that matters. What changed against the plan:
+   gate and up are concatenated at load into one `[32768, 2048]` weight, so
+   the MLP is one product, one GeGLU and the down product with the residual
+   folded into its store; and the per-step intermediates are sized by a step
+   capacity of their own (`maxStepRows`) rather than by the window, since at
+   8192 rows the gated pair alone was 1.6 GB for buffers a decode step uses one
+   row of.
+4. **Done at the synthetic scale.** `Generation`'s `Gemma` is the runtime: a
+   string in, the prefill in blocks of the prompt capacity, then one command
+   buffer per token with two in the air, Argmax writing the token into the
+   sequence buffer on the device and the next step's Embed reading it there.
+   The host reads a slot back for the stop condition and a callback only.
+   Checked against a loop the test drives itself over `Decoder::step` and a
+   CPU argmax, over a synthetic `tokenizer.json` of the model's width.
 5. Performance rounds: the BF16 read lands in eacp first, since it decides the
-   whole memory budget; then the fused GeGLU, the split counts, and pipelining
-   steps per command buffer.
-6. Sampling, and a demo app.
+   whole memory budget; then the fused GeGLU, the split counts (the decoder's
+   64 and 32 are WhisperEACP's numbers, unmeasured on Gemma's widths), and
+   the prompt-capacity and lane-count guesses.
+6. **Half done.** `Sampling` is the CPU sampler — temperature, top-k, top-p in
+   Hugging Face's processor order, a seeded draw the standard specifies so a
+   seed means the same token sequence on every machine — and a temperature
+   above zero routes the loop through a 1 MB logits readback per token, one
+   step in flight. `Apps/Console/Generate` streams a continuation for a prompt
+   and prints the two halves' timings. On-device sampling is a later round.
+   Nothing above has touched the real checkpoint: it needs a download and
+   `GEMMA_MODEL_DIR`, and the first run against it is the next step.
 
 ## Open decisions
 
 - Does the BF16 read go into eacp now, so this project never carries a widened
   fp32 path at all?
-- Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B?
+- Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B? The
+  logits buffer now hits the limit at a prompt capacity of 2048 rows, so it
+  is a 2B question too, though one a smaller prefill block sidesteps.

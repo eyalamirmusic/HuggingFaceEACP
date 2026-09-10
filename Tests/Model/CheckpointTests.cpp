@@ -1,5 +1,7 @@
 #include "Common.h"
 
+#include <iostream>
+
 // The real google/gemma-2b files, which are a manual download and never a
 // commit: the repo is gated, so nothing in this build fetches them. Point
 // GEMMA_MODEL_DIR at a directory that has them and every test here runs;
@@ -39,6 +41,29 @@ auto tCheckpointFilesAreThere = test("Model/Checkpoint/filesAreThere") = []
     // gemma-2b ships two shards and an index; a repo that has been merged into
     // one file is legal too, which is why this is not an equality.
     check(files.shards.size() >= 1);
+};
+
+// gemma-2b.gguf, the 10 GB F32 conversion the same repo ships beside the
+// safetensors and the file Tests/Oracle runs llama.cpp over. Recorded and not
+// required, the way the tokenizer files are: a checkpoint downloaded for the
+// kernels alone has no reason to carry it, so this says which of the two a
+// directory is rather than failing on the smaller one.
+auto tCheckpointGgufIsRecorded = test("Model/Checkpoint/ggufIsRecorded") = []
+{
+    if (!hasRealCheckpoint())
+        return;
+
+    const auto files = ModelFiles::fromEnvironment();
+
+    if (!files.hasGgufModel())
+    {
+        std::cout << "  no " << ModelFileNames::ggufModel
+                  << " in the checkpoint, so the llama.cpp oracle skips\n";
+        return;
+    }
+
+    check(files.ggufModel.filename() == ModelFileNames::ggufModel);
+    check(files.ggufModel.parent_path() == files.directory);
 };
 
 auto tCheckpointConfig = test("Model/Checkpoint/config") = []

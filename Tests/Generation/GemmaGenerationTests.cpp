@@ -1,0 +1,145 @@
+#include "Common.h"
+
+#include <iostream>
+#include <string>
+
+// The real checkpoint, which nothing here has: google/gemma-2b is gated, this
+// machine has no copy, and a build cannot fetch one unauthenticated. So every
+// test below returns early until GEMMA_MODEL_DIR names a directory — plan.md's
+// fourth gap and its answer.
+//
+// This is the first test in the tree that asserts something about what the
+// model *says* rather than about a number: a base completion model given "The
+// capital of France is" continues with " Paris", and it is the one assertion
+// that fails if the loader, the tokenizer, the eighteen layers, the KV cache
+// and the greedy search are each nearly right. The tiers below it are what say
+// which of them it was.
+
+using namespace nano;
+using namespace HF;
+using namespace HF::Testing;
+using namespace eacp::GPU;
+
+namespace
+{
+bool hasRealCheckpoint()
+{
+    return Device::shared().isValid() && ModelFiles::hasDirectoryInEnvironment();
+}
+
+// Small enough that a first run is seconds rather than a minute, and long
+// enough that a continuation has somewhere to put the word.
+constexpr auto smokeTokens = 8;
+
+void reportTimings(const Gemma& gemma, int tokenCount)
+{
+    const auto decode = gemma.lastDecodeSeconds();
+    const auto perToken = tokenCount > 0 ? decode / tokenCount : 0.0;
+
+    std::cout << "  prefill               " << gemma.lastPrefillSeconds() << " s\n";
+    std::cout << "  decode, " << tokenCount << " tokens    " << decode << " s   "
+              << (perToken > 0.0 ? 1.0 / perToken : 0.0) << " tokens/s over "
+              << gemma.lastStepCount() << " steps\n";
+}
+} // namespace
+
+// The whole runtime end to end, which is what plan.md's fourth step is: a
+// string in and a string out.
+auto tGemmaGeneratesText = test("Generation/Gemma/completesAPrompt") = []
+{
+    if (!hasRealCheckpoint())
+        return;
+
+    auto gemma = Gemma {};
+    gemma.loadFromEnvironment();
+
+    check(gemma.isLoaded());
+    check(gemma.config().vocabularySize == 256000);
+    check(gemma.tokenizer().bos() == gemma.config().beginningOfSequenceToken);
+
+    gemma.prepare();
+
+    check(gemma.isPrepared());
+    check(gemma.shape().maxPositions == gemma.config().maxPositions);
+    check(gemma.shape().stepRowCapacity() == Gemma::defaultPromptCapacity);
+
+    gemma.setMaximumTokens(smokeTokens);
+
+    // Streamed as it arrives, which is what the callback is for and what the
+    // Generate app prints: a run that stalls says where.
+    auto streamed = Vector<TokenId> {};
+    gemma.onToken = [&streamed](TokenId token) { streamed.add(token); };
+
+    const auto text = gemma.generateText("The capital of France is");
+
+    check(streamed.size() > 0);
+    check(streamed.size() <= smokeTokens);
+
+    std::cout << "  \"The capital of France is\" ->\"" << text << "\"\n";
+    reportTimings(gemma, streamed.size());
+
+    check(text.find("Paris") != std::string::npos);
+};
+
+// The two sampling paths over the real model, which is the one comparison that
+// cannot be made at the synthetic shape: a temperature just above zero with
+// top-k one leaves exactly the largest logit in the running, so the readback
+// draw has to land on the token the on-device Argmax took.
+auto tGemmaSampledPathAgrees = test("Generation/Gemma/sampledPathAgrees") = []
+{
+    if (!hasRealCheckpoint())
+        return;
+
+    auto gemma = Gemma {};
+    gemma.loadFromEnvironment();
+    gemma.prepare();
+
+    gemma.setMaximumTokens(4);
+
+    const auto greedy = gemma.generateFromText("The capital of France is");
+
+    gemma.setSampling(SamplingOptions {.temperature = 1.0e-3f, .topK = 1});
+
+    const auto sampled = gemma.generateFromText("The capital of France is");
+
+    check(sameTokens(greedy, sampled));
+
+    std::cout << "  greedy and readback agree over " << greedy.size() << " tokens\n";
+};
+
+// A prompt longer than one prefill block, at the real widths: the blocks append
+// to the same caches at the same positions, so the continuation is the one a
+// single block would have produced. Run at a small capacity on purpose, since
+// the default swallows any prompt a test would write.
+auto tGemmaBlockedPrefillAgrees = test("Generation/Gemma/blockedPrefillAgrees") = []
+{
+    if (!hasRealCheckpoint())
+        return;
+
+    constexpr auto prompt =
+        "Paris is the capital of France, and Rome is the capital of";
+
+    auto whole = Gemma {};
+    whole.loadFromEnvironment();
+    whole.prepare();
+    whole.setMaximumTokens(4);
+
+    const auto unblocked = whole.generateFromText(prompt);
+    check(whole.lastStepCount() == 1 + unblocked.size() - 1);
+
+    auto blocked = Gemma {};
+    blocked.loadFromEnvironment();
+    blocked.setPromptCapacity(4);
+    blocked.prepare();
+    blocked.setMaximumTokens(4);
+
+    check(blocked.shape().stepRowCapacity() == 4);
+
+    const auto inBlocks = blocked.generateFromText(prompt);
+
+    check(sameTokens(unblocked, inBlocks));
+    check(blocked.lastStepCount() > whole.lastStepCount());
+
+    std::cout << "  blocked prefill took " << blocked.lastStepCount()
+              << " steps against " << whole.lastStepCount() << "\n";
+};

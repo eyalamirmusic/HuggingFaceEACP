@@ -12,3 +12,10 @@ add_subdirectory(GPU)
 add_subdirectory(Model)
 add_subdirectory(Tokenizer)
 add_subdirectory(Kernels)
+add_subdirectory(Decoder)
+add_subdirectory(Sampling)
+add_subdirectory(Generation)
+
+# llama.cpp over the GGUF, the tier above the scalar references. Empty unless
+# HF_EACP_ENABLE_LLAMA_CPP is on, which is also what fetches llama.cpp.
+add_subdirectory(Oracle)

@@ -23,12 +23,14 @@ namespace HF
 // uniform, since it is the stride both the table and the output are walked at.
 //
 // scale is a uniform rather than sqrt(W) computed here, and that is not a
-// convenience. Gemma multiplies the embedding by the hidden size's square root
-// rounded through bfloat16 — the constant is built as a bf16 value in the
-// reference implementation, so at W = 2048 the factor is 45.25 exactly and not
-// sqrt(2048) = 45.254833. Baking the square root in would put a kernel one
-// bf16 rounding away from the reference on every token; taking the number from
-// the caller keeps that decision in the model, where config.json is.
+// convenience: which square root it is depends on what the model is running
+// in, and that is the config's decision rather than this kernel's. Hugging
+// Face builds the constant in the model's own dtype, so a bf16 run rounds it
+// to 45.25 at W = 2048 where sqrt(2048) is 45.254833; llama.cpp over an F32
+// GGUF — the oracle plan.md's third step compares against — uses sqrtf(n_embd)
+// unrounded, and so does DecoderShape::embeddingScale. Baking either in would
+// put a kernel one rounding away from whichever reference it is being read
+// against; taking the number from the caller keeps that where config.json is.
 //
 // The ids arrive through an integer buffer, which is what lets the id Argmax
 // wrote at the end of one step be the id this reads at the start of the next

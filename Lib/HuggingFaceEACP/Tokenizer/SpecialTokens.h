@@ -6,10 +6,6 @@
 
 namespace HF
 {
-using TokenId = int;
-
-inline constexpr auto invalidTokenId = TokenId {-1};
-
 // The tokens that steer generation, named rather than numbered. Every field is
 // read out of the model's tokenizer.json rather than hard-coded: gemma-2b's
 // generation_config gives BOS 2, EOS 1 and PAD 0, and the numbers below are

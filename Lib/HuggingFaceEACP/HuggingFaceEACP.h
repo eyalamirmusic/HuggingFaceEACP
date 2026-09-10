@@ -9,6 +9,12 @@
 // it needs.
 
 #include "Core/Core.h"
+#include "Decoder/Decoder.h"
+
+// Generation has one class, so Gemma.h doubles as its umbrella the way
+// Decoder/Decoder.h does — there is no Generation/Generation.h to include.
+#include "Generation/Gemma.h"
 #include "Kernels/Kernels.h"
 #include "Model/Model.h"
+#include "Sampling/Sampling.h"
 #include "Tokenizer/Tokenizer.h"

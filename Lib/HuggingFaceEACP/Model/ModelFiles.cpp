@@ -65,6 +65,11 @@ bool ModelFiles::hasTokenizer() const
     return !tokenizerJson.empty() || !tokenizerModel.empty();
 }
 
+bool ModelFiles::hasGgufModel() const
+{
+    return !ggufModel.empty();
+}
+
 ModelFiles ModelFiles::fromDirectory(const std::filesystem::path& directory)
 {
     auto error = std::error_code {};
@@ -80,6 +85,7 @@ ModelFiles ModelFiles::fromDirectory(const std::filesystem::path& directory)
     files.shardIndex = fileIfPresent(directory, ModelFileNames::shardIndex);
     files.tokenizerJson = fileIfPresent(directory, ModelFileNames::tokenizerJson);
     files.tokenizerModel = fileIfPresent(directory, ModelFileNames::tokenizerModel);
+    files.ggufModel = fileIfPresent(directory, ModelFileNames::ggufModel);
 
     if (files.isSharded())
         files.shards = shardsFromIndex(directory, files.shardIndex);

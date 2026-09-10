@@ -19,13 +19,14 @@ belongs in eacp rather than in a workaround here. `plan.md` is the plan — the
 model's shape, what carries over from WhisperEACP, what is new, and the ranked
 list of eacp gaps — and is the file to read before adding anything.
 
-Right now this is plan.md's first two steps: `Core`, the `Model` loader with
-its shard index and Gemma config, the `Tokenizer`, and `Kernels` — the op set
-the decoder will be assembled out of, each kernel checked against a scalar CPU
-reference. The decoder and the generation loop are still to come, and nothing
-has been run against the real checkpoint: the repo is gated and there is no
-download on this machine, so every test against it returns early until
-`GEMMA_MODEL_DIR` points at one.
+Right now this runs end to end at the synthetic scale: `Core`, the `Model`
+loader with its shard index and Gemma config, the `Tokenizer`, `Kernels` — the
+op set each kernel is checked against a scalar CPU reference — the `Decoder`
+that is Gemma's forward pass over a KV cache, the CPU `Sampling`, and
+`Generation`, the KV-cached loop that takes a string and returns one. What is
+missing is the run against the real checkpoint: the repo is gated and there is
+no download on this machine, so every test against it returns early and the
+`Generate` app says so until `GEMMA_MODEL_DIR` points at one.
 
 ## Build Commands
 
@@ -54,6 +55,21 @@ ctest --test-dir build --output-on-failure
 
 - `HF_EACP_ENABLE_TESTS` / `HF_EACP_ENABLE_APPS` (default: on when top-level):
   the `Tests/` and `Apps/` trees.
+
+- `HF_EACP_ENABLE_LLAMA_CPP` (default `OFF`): fetches llama.cpp at a pinned
+  release tag and builds `Tests/Oracle`, which compares our tokens and our
+  logits against it. Off by default because both halves are expensive in a way
+  the rest of this build is not — llama.cpp and ggml are minutes of compile,
+  and the `gemma-2b.gguf` the tests read is a 10 GB manual download, so every
+  test there skips without one. It means nothing without
+  `HF_EACP_ENABLE_TESTS`. The fetch names every ggml backend off, so the
+  reference is exactly ggml's CPU arithmetic and a disagreement cannot be a
+  backend's.
+
+  ```bash
+  cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DHF_EACP_UNITY_BUILD=OFF \
+        -DHF_EACP_ENABLE_LLAMA_CPP=ON
+  ```
 
 - `HF_EACP_CI_BUILD` (default `OFF`): turns on the unity builds here and in eacp
   and Miro. There is no CI (see below); the switch is what makes that
@@ -128,9 +144,10 @@ rather than `eacp-core`, since every layer above it will hold GPU buffers. The
 version comes from `project()` through compile definitions, so there is no
 second copy to drift.
 
-The modules `plan.md` calls for — the safetensors loader with its shard index,
-the tokenizer, the kernels, the decoder and the generation loop — land beside it
-in that order.
+The modules `plan.md` calls for sit beside it in that order, each one linking
+only what is in its own signatures: the safetensors loader with its shard index,
+the tokenizer, the kernels, the decoder, the sampler, and `Generation` on top of
+the three of them a run needs.
 
 ## Tests (`Tests`)
 
@@ -157,12 +174,20 @@ runs against MSL on Apple and HLSL on Windows.
 | `Lib/HuggingFaceEACP/Model` | Safetensors with the shard index, `config.json`, the tensor catalogue, and the `GEMMA_MODEL_DIR` locator |
 | `Lib/HuggingFaceEACP/Tokenizer` | Gemma's SentencePiece-style BPE from `tokenizer.json`, with byte fallback |
 | `Lib/HuggingFaceEACP/Kernels` | The op set: the products, the reductions, RMSNorm, RoPE, GeGLU and the multi-query attention |
+| `Lib/HuggingFaceEACP/Decoder` | Gemma's forward pass over a KV cache: the shape, the weights, and one compute pass per step |
+| `Lib/HuggingFaceEACP/Sampling` | The CPU sampler over a read-back logits row: greedy, temperature, top-k, top-p |
+| `Lib/HuggingFaceEACP/Generation` | `Gemma`: the whole runtime, a string in and a string out, with the greedy loop's token feedback on the device |
 | `Apps/Console/DeviceInfo` | What this machine's GPU offers, printed from eacp's `Device` |
+| `Apps/Console/Generate` | A prompt in and a continuation streamed out, over the model `GEMMA_MODEL_DIR` names |
 | `Tests/Core` | The version, without a device |
 | `Tests/GPU` | The compute smoke test: eacp's toolchain end to end |
 | `Tests/Model` | Shards and config over safetensors files the tests write themselves |
 | `Tests/Tokenizer` | A hand-written mini `tokenizer.json` fixture |
 | `Tests/Kernels` | A double-precision scalar reference per kernel |
+| `Tests/Decoder` | A double-precision reference decoder over a synthetic checkpoint the tests write |
+| `Tests/Sampling` | Greedy, temperature, top-k and top-p on the CPU, seeded and reproducible |
+| `Tests/Generation` | The loop against one the test runs itself, over the synthetic checkpoint and a `tokenizer.json` of the same width |
+| `Tests/Oracle` | llama.cpp over the F32 GGUF, behind `HF_EACP_ENABLE_LLAMA_CPP` |
 | `Tests/Support` | `GpuTestMain.cpp`, the shared entry point for GPU-touching suites |
 
 ## Code Style

@@ -85,6 +85,34 @@ endif ()
 option(HF_EACP_ENABLE_TESTS "Enable tests for HuggingFaceEACP"
         ${PROJECT_IS_TOP_LEVEL})
 
+option(HF_EACP_ENABLE_LLAMA_CPP
+        "Fetch llama.cpp and build the tests that compare against it" OFF)
+
+# Off by default, and it only means anything with the tests in the tree, since
+# Tests/Oracle is the only thing that links it. Both halves are expensive in a
+# way the rest of this build is not: llama.cpp and ggml are minutes of compile,
+# and the GGUF the tests read is a 10 GB manual download.
+#
+# Fetched here rather than inside Tests/Oracle because llama.cpp's targets are
+# named globally, so a tree holds one build of it however many directories end
+# up wanting one.
+if (HF_EACP_ENABLE_TESTS AND HF_EACP_ENABLE_LLAMA_CPP)
+    include(HFLlamaCpp)
+
+    # Every backend off, so the oracle computes exactly ggml's own CPU path and
+    # a disagreement with ours cannot be a backend's. GGML_BLAS is its own
+    # switch and is not implied by GGML_ACCELERATE OFF: without it the
+    # configure still finds Accelerate and links BLAS into the reference.
+    #
+    # GGML_METAL OFF also keeps Objective-C out of the tree — ggml-metal is
+    # .m rather than .mm, and this project enables OBJCXX only.
+    hf_add_llama_cpp(OPTIONS
+            "GGML_METAL OFF"
+            "GGML_BLAS OFF"
+            "GGML_ACCELERATE OFF"
+            "GGML_OPENMP OFF")
+endif ()
+
 if (HF_EACP_ENABLE_TESTS)
     enable_testing()
     add_subdirectory(Tests)

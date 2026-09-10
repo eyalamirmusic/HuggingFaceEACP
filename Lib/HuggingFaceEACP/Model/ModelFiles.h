@@ -18,6 +18,11 @@ inline constexpr auto shardIndex = "model.safetensors.index.json";
 inline constexpr auto weights = "model.safetensors";
 inline constexpr auto tokenizerJson = "tokenizer.json";
 inline constexpr auto tokenizerModel = "tokenizer.model";
+
+// The F32 GGUF the same repo ships beside the safetensors. Nothing in this
+// library reads it — it is llama.cpp's format, and llama.cpp is the oracle
+// Tests/Oracle checks our logits and our tokens against.
+inline constexpr auto ggufModel = "gemma-2b.gguf";
 } // namespace ModelFileNames
 
 // google/gemma-2b is a gated repo: downloading it needs an account that
@@ -31,9 +36,9 @@ inline constexpr auto modelDirectoryVariable = "GEMMA_MODEL_DIR";
 // filesystem. Locating is the whole job; nothing here opens a byte.
 //
 // config.json and the weights are required, because a directory without them
-// is not a checkpoint. The tokenizer files are recorded and not required: a
-// caller loading weights to test a kernel has no use for them, and the
-// tokenizer's own error is better than one from here.
+// is not a checkpoint. The tokenizer files and the GGUF are recorded and not
+// required: a caller loading weights to test a kernel has no use for them, and
+// the tokenizer's own error is better than one from here.
 struct ModelFiles
 {
     std::filesystem::path directory;
@@ -43,10 +48,12 @@ struct ModelFiles
     Vector<std::filesystem::path> shards;
     std::filesystem::path tokenizerJson;
     std::filesystem::path tokenizerModel;
+    std::filesystem::path ggufModel;
 
     bool isSharded() const;
     bool hasGenerationConfig() const;
     bool hasTokenizer() const;
+    bool hasGgufModel() const;
 
     // Throws a ModelError naming the directory and the file it wanted.
     static ModelFiles fromDirectory(const std::filesystem::path& directory);

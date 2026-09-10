@@ -14,10 +14,25 @@ add_subdirectory(Tokenizer)
 # the gated MLP and the multi-query attention.
 add_subdirectory(Kernels)
 
+# The decoder itself: Gemma's forward pass over a KV cache, one compute pass
+# per step, assembled out of the kernels above and the weights beside them.
+add_subdirectory(Decoder)
+
+# The last step of a generation step, on the CPU behind a logits readback: the
+# temperature, top-k, top-p and the draw.
+add_subdirectory(Sampling)
+
+# The loop that drives all of the above: a string in, the KV-cached decode with
+# its token feedback on the device, and a string out.
+add_subdirectory(Generation)
+
 # The whole library, for consumers that don't want to name the modules they use.
 add_library(HuggingFaceEACP INTERFACE)
 target_link_libraries(HuggingFaceEACP INTERFACE
         hf-core
         hf-model
         hf-tokenizer
-        hf-kernels)
+        hf-kernels
+        hf-decoder
+        hf-sampling
+        hf-generation)
