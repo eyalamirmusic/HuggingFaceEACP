@@ -19,8 +19,13 @@ belongs in eacp rather than in a workaround here. `plan.md` is the plan — the
 model's shape, what carries over from WhisperEACP, what is new, and the ranked
 list of eacp gaps — and is the file to read before adding anything.
 
-Right now this is a skeleton: `Core` and the two test modules that prove the
-compute path is reachable, and nothing of the model yet.
+Right now this is plan.md's first two steps: `Core`, the `Model` loader with
+its shard index and Gemma config, the `Tokenizer`, and `Kernels` — the op set
+the decoder will be assembled out of, each kernel checked against a scalar CPU
+reference. The decoder and the generation loop are still to come, and nothing
+has been run against the real checkpoint: the repo is gated and there is no
+download on this machine, so every test against it returns early until
+`GEMMA_MODEL_DIR` points at one.
 
 ## Build Commands
 
@@ -149,9 +154,15 @@ runs against MSL on Apple and HLSL on Windows.
 | `plan.md` | The plan: Gemma 2B's shape, what carries over from WhisperEACP, and the ranked eacp gaps |
 | `CMake` | `CPM.cmake`, the two `Find` modules that fetch eacp and NanoTest, and `HFTargetSetup.cmake` |
 | `Lib/HuggingFaceEACP/Core` | Shared types and the library version. Links `eacp-gpu` |
+| `Lib/HuggingFaceEACP/Model` | Safetensors with the shard index, `config.json`, the tensor catalogue, and the `GEMMA_MODEL_DIR` locator |
+| `Lib/HuggingFaceEACP/Tokenizer` | Gemma's SentencePiece-style BPE from `tokenizer.json`, with byte fallback |
+| `Lib/HuggingFaceEACP/Kernels` | The op set: the products, the reductions, RMSNorm, RoPE, GeGLU and the multi-query attention |
 | `Apps/Console/DeviceInfo` | What this machine's GPU offers, printed from eacp's `Device` |
 | `Tests/Core` | The version, without a device |
 | `Tests/GPU` | The compute smoke test: eacp's toolchain end to end |
+| `Tests/Model` | Shards and config over safetensors files the tests write themselves |
+| `Tests/Tokenizer` | A hand-written mini `tokenizer.json` fixture |
+| `Tests/Kernels` | A double-precision scalar reference per kernel |
 | `Tests/Support` | `GpuTestMain.cpp`, the shared entry point for GPU-touching suites |
 
 ## Code Style

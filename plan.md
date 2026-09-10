@@ -171,6 +171,27 @@ which is the same order as the Whisper decoder's step.
    has the uint arithmetic already, so this is convenience rather than
    capability. It is the step from 100 to a few hundred tokens per second.
 
+Found while writing steps 1 and 2, unranked:
+
+- **Metal's `tanh` returns NaN for a large argument.** eacp compiles its Metal
+  library with fast math on and no `MTLCompileOptions`, and under that mode
+  `tanh(990)` is NaN rather than 1. tanh GELU's argument grows as the cube of
+  its input, so an activation of 30 hits it. `Gelu.h` clamps the argument to
+  ±10, past where `tanh` is exactly `1.0f`; the fix in eacp is a saturating
+  helper beside `eacpErf`, or explicit compile options.
+- **No SIMD-group-scoped reduction.** `groupSum` and `groupMax` always go
+  through threadgroup scratch and two barriers, even when the group is one
+  SIMD group wide. Inside attention's per-tile loop that is four barriers per
+  64 keys. A `simdSum`/`simdMax`, or `fold()` skipping the scratch when the
+  group fits a SIMD group, removes them.
+- **No threadgroup-memory budget in the EDSL.** `shared<T>(count)` is
+  compile-time and nothing reports what the backend allows, so Metal's 32 KB
+  is a number a kernel author has to know; the attention kernel caps the head
+  width at 256 by hand.
+- **`readHalf`-style vector reads emit scalar subscripts.** `InputBuffer::read4`
+  is four loads and an index round-trip rather than one 16-byte load. Correct,
+  just not the load it reads as.
+
 Already filled since the Whisper rounds: 3D dispatch exists, so the head no
 longer has to be folded into the dispatch row; `CommandTimer` times
 off-screen command buffers.
@@ -179,10 +200,19 @@ off-screen command buffers.
 
 Mirrors how WhisperEACP went, one module and one test tier at a time:
 
-1. Loader with shards, config, and the tokenizer, with a double-precision CPU
-   reference of one layer as the first test.
-2. The four new kernels (RMSNorm, RoPE, GeGLU, MQA attention with a 256-wide
-   head) with scalar references in `Tests/Kernels`.
+1. **Done.** Loader with shards, config, and the tokenizer. The one-layer CPU
+   reference moved to step 3, where the decoder's shape it checks exists. What
+   changed against the plan above: WhisperEACP's 2 GB whole-file limit had to
+   go, since the first shard is 4.95 GB, and is now per tensor; and byte
+   fallback runs *before* the merges, at character granularity, which is
+   Hugging Face's order. Whether Gemma prepends a dummy `▁` is read from the
+   JSON and defaults to off, unconfirmed until the real file is here.
+2. **Done.** The four new kernels, with scalar references in `Tests/Kernels`.
+   The attention's value fold is laid out by column, so a group holds one
+   256-wide accumulator (1.5 KB) rather than one per lane. The SIMD-matrix
+   switch WhisperEACP carries was dropped: eacp `develop` has it
+   unconditionally. Nothing has run against the real checkpoint; every test
+   that needs it returns early until `GEMMA_MODEL_DIR` is set.
 3. Prefill of a prompt, logits checked against llama.cpp over the GGUF.
 4. The KV-cached greedy loop, a string in and a string out.
 5. Performance rounds: the BF16 read lands in eacp first, since it decides the

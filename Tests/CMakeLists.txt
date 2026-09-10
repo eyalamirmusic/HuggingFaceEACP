@@ -9,3 +9,6 @@ set(HF_GPU_TEST_MAIN "${CMAKE_CURRENT_LIST_DIR}/Support/GpuTestMain.cpp")
 
 add_subdirectory(Core)
 add_subdirectory(GPU)
+add_subdirectory(Model)
+add_subdirectory(Tokenizer)
+add_subdirectory(Kernels)
