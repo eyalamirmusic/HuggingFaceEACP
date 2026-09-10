@@ -82,9 +82,29 @@ public:
     // the paths must still name the files when prepare() reads them.
     void load(const ModelFiles& files);
 
-    // The directory GEMMA_MODEL_DIR names. gemma-2b is a gated repo, so
-    // nothing in this build fetches one — plan.md's fourth gap and its answer.
-    void loadFromEnvironment();
+    // The model the build copied beside this binary, if it copied one: the
+    // files under bundledModelDirectoryName, in the bundle's Resources on
+    // macOS and next to the executable otherwise. A ModelError names the
+    // directory it looked for when there is none, since a build that meant to
+    // ship a model and never asked for the copy should not read as a corrupt
+    // one; a directory that is there but short a file fails the way
+    // load(path) does, naming the file.
+    //
+    // A binary gets one by calling hf_bundle_model(<target>) in its
+    // CMakeLists, in a build configured with -DHF_EACP_FETCH_MODEL=ON — the
+    // default. Nothing here copies a model on its own: 5 GB beside every
+    // executable is a decision the build makes, not the runtime.
+    void loadBundled();
+
+    static bool hasBundledModel();
+
+    // resourcesDirectory() / bundledModelDirectoryName, whether or not
+    // anything is there.
+    static std::filesystem::path bundledModelDirectory();
+
+    // The directory hf_bundle_model copies into. Spelled here and in
+    // Model/CMakeLists.txt, and nowhere else.
+    static constexpr auto bundledModelDirectoryName = "GemmaModel";
 
     bool isLoaded() const { return weightFile.has_value(); }
 

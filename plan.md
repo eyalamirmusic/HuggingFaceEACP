@@ -10,9 +10,16 @@ The second goal is WhisperEACP's second goal: a real net surfaces what eacp's
 compute layer is missing, and a gap belongs in eacp rather than in a workaround
 here. The gaps this plan already sees are in the last section.
 
-The Gemma numbers below are from the released config as remembered, not read
-from the file: the repo is gated and was not fetched. **Confirm every number
-against `config.json` once the model is downloaded.**
+The Gemma numbers below were from the released config as remembered rather than
+read. **They are now read**: `HF_EACP_FETCH_MODEL` fetches the checkpoint at
+configure time, and `Model/Checkpoint/config` and `matchesTheCatalogue` assert
+every shape against the file. The table holds — `hidden_size` 2048,
+`intermediate_size` 16384, 18 layers, 8 query heads of `head_dim` 256 over one
+KV head, `vocab_size` 256000, `max_position_embeddings` 8192, `rms_norm_eps`
+1e-6, `rope_theta` 10000, tied embeddings, BOS 2 / EOS 1 / PAD 0. What the
+table has wrong is the sharding: the mirror the build fetches ships **one
+unsharded 5.0 GB `model.safetensors`**, not two shards, which is why
+`ModelFiles` requires either an index or a single file rather than the two.
 
 ## What Gemma 2B is, in WhisperEACP's terms
 
@@ -53,10 +60,18 @@ The embedding is `[256000, 2048]`, the only tensor above a gigabyte.
 | `tokenizer.model` | 4.2 MB | the SentencePiece original |
 | `gemma-2b.gguf` | 10 GB | F32, usable as an oracle through llama.cpp |
 
-The repo is **gated**: a download needs a Hugging Face account that accepted
-Google's terms and a token. This machine has no cached copy and no
-`huggingface-cli`, and WhisperEACP's pattern of fetching the model through CPM
-at configure time will not work unauthenticated.
+`google/gemma-2b` is **gated**: a download needs a Hugging Face account that
+accepted Google's terms and a token, and an unauthenticated fetch answers 401,
+so WhisperEACP's pattern of fetching through CPM cannot point at it. It points
+at `unsloth/gemma-2b` instead — an ungated mirror of the same bf16 weights,
+pinned to a commit — which is gap 4 below and is how the build now gets a
+model. The mirror is **unsharded**: one 5.0 GB `model.safetensors` in place of
+the two shards and the index above. It carries `tokenizer.model` too, though
+the fetch does not take it — nothing here reads the SentencePiece original —
+and what it has no copy of at all is `gemma-2b.gguf`. The GGUF is what
+`Tests/Oracle` reads, and it is the one thing
+still worth doing Google's gated download for; `GEMMA_MODEL_DIR` is how a
+machine that has done it says so.
 
 `gemma-2b` is the base completion model. `gemma-2b-it` is the same architecture
 with a chat prompt format, so supporting both is a prompt change only.
@@ -156,9 +171,18 @@ which is the same order as the Whisper decoder's step.
    into one buffer over the whole shard (offsets are 4-byte aligned, which the
    ranged bind needs; check per tensor). D3D12 has no equivalent and keeps
    copying behind the same API. Worth doing; not needed for a first token.
-4. **Loading a gated model.** Not a GPU gap. The CPM download needs either a
-   token from the environment or a documented `GEMMA_MODEL_DIR` pointing at a
-   manual download. Do the latter first.
+4. **Loading a gated model. Done, through a mirror.** Not a GPU gap.
+   `google/gemma-2b` answers 401 to an unauthenticated download, so CPM cannot
+   fetch it and a token in the environment was the only way through it.
+   `unsloth/gemma-2b` is an ungated mirror of the same bf16 weights — one
+   unsharded `model.safetensors`, the same tokenizer, the same config numbers —
+   so `HF_EACP_FETCH_MODEL` fetches the four files from it at a pinned commit,
+   `hf_bundle_model(<target>)` copies them beside a binary, and
+   `Gemma::loadBundled()` finds the copy. Nothing has to be arranged by hand.
+   `GEMMA_MODEL_DIR` stays as the explicit override, and is what a machine that
+   *has* done Google's gated download names it with — the GGUF beside the
+   safetensors is the one thing the mirror does not carry, and `Tests/Oracle`
+   reads it.
 5. **Threading.** eacp's GPU layer is main-thread only. Two hundred tokens at
    10 ms each is two seconds of message thread if driven synchronously.
    `commitAsync` and the scoped wait exist, so record several steps per command
@@ -234,16 +258,25 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    go, since the first shard is 4.95 GB, and is now per tensor; and byte
    fallback runs *before* the merges, at character granularity, which is
    Hugging Face's order. Whether Gemma prepends a dummy `▁` is read from the
-   JSON and defaults to off, unconfirmed until the real file is here.
+   JSON and defaults to off, and **the real file settles it**: gemma-2b's
+   normalizer is a bare `Replace(" " -> "▁")` with a null `pre_tokenizer` and
+   no `Prepend`, so the dummy prefix and the pre-merge split are both off. It
+   also settles the byte pieces, which were assumed to be 256 of them: there
+   are **255**, at ids 217..472, and id 226 — where `<0x09>` would sit — is a
+   literal tab instead. `Tokenizer/realTokenizerParseTime` asserted the wrong
+   thing about that and now asserts what matters, which is that every byte
+   reaches a piece standing for exactly it.
 2. **Done.** The four new kernels, with scalar references in `Tests/Kernels`.
    The attention's value fold is laid out by column, so a group holds one
    256-wide accumulator (1.5 KB) rather than one per lane. The SIMD-matrix
    switch WhisperEACP carries was dropped: eacp `develop` has it
-   unconditionally. Nothing has run against the real checkpoint; every test
-   that needs it returns early until `GEMMA_MODEL_DIR` is set.
-3. **Built, not yet run.** `Decoder` is the forward pass over a KV cache, one
-   compute pass per step, checked against a double-precision reference over a
-   synthetic checkpoint the tests write (2e-7 relative, asserted at 5e-6),
+   unconditionally. The kernels' own references never needed a checkpoint, and
+   the suites that do now get one from the build's fetch — a test skips only
+   in a build configured with `-DHF_EACP_FETCH_MODEL=OFF`.
+3. **Run, against the real checkpoint.** `Decoder` is the forward pass over a
+   KV cache, one compute pass per step, checked against a double-precision
+   reference over a synthetic checkpoint the tests write (2e-7 relative,
+   asserted at 5e-6),
    through both the many-row tiled product and the one-row split product,
    and through a two-shard checkpoint. The llama.cpp comparison exists behind
    `HF_EACP_ENABLE_LLAMA_CPP` — llama.cpp pinned at `b10900`, every ggml
@@ -251,22 +284,49 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    prefill and token-by-token logits against its rows, an eight-token greedy
    continuation, and the config's numbers against the GGUF's header, which is
    what retires the "confirm every number" caveat above. Every one of them
-   skips until `GEMMA_MODEL_DIR` holds the checkpoint and `gemma-2b.gguf`, so
-   the elementwise tolerance there is provisional and the argmax and top-5
-   agreement is the assertion that matters. What changed against the plan:
+   still skips until `GEMMA_MODEL_DIR` names a directory holding
+   `gemma-2b.gguf`, which is Google's own gated download and not the mirror the
+   build fetches, so the elementwise tolerance there is provisional and the
+   argmax and top-5 agreement is the assertion that matters. What changed
+   against the plan:
    gate and up are concatenated at load into one `[32768, 2048]` weight, so
    the MLP is one product, one GeGLU and the down product with the residual
    folded into its store; and the per-step intermediates are sized by a step
    capacity of their own (`maxStepRows`) rather than by the window, since at
    8192 rows the gated pair alone was 1.6 GB for buffers a decode step uses one
    row of.
-4. **Done at the synthetic scale.** `Generation`'s `Gemma` is the runtime: a
-   string in, the prefill in blocks of the prompt capacity, then one command
+4. **Done, and run against the real checkpoint.** `Generation`'s `Gemma` is
+   the runtime: a string in, the prefill in blocks of the prompt capacity,
+   then one command
    buffer per token with two in the air, Argmax writing the token into the
    sequence buffer on the device and the next step's Embed reading it there.
    The host reads a slot back for the stop condition and a callback only.
    Checked against a loop the test drives itself over `Decoder::step` and a
    CPU argmax, over a synthetic `tokenizer.json` of the model's width.
+
+   **What the first run against the real checkpoint showed.** Three things,
+   two of them corrections and one of them open:
+
+   - `config.json` carries `"hidden_activation": null` beside a
+     `"hidden_act": "gelu"`, and the loader threw on it — `stringFieldOr`
+     refuses a field that is present and not a string. transformers writes
+     that null when the newer key was never set and reads it as Gemma's own
+     `gelu_pytorch_tanh` with `hidden_act` ignored, so `activationOf` now
+     treats an explicit null as the default and only an absent key defers to
+     the older spelling. Nothing dispatches on the value; it is recorded.
+   - The 256 byte pieces are 255. See item 1 above: id 226 is a literal tab.
+   - **Greedy from "The capital of France is" does not reach Paris.** It
+     produces `" a city of contrasts. It is a city of history, of art, of"`,
+     which is fluent and on-topic, so the whole stack is doing something
+     coherent — but `Generation/Gemma/completesAPrompt` asserts `Paris` and
+     that assertion fails. Unresolved and deliberately left failing: whether
+     this is our arithmetic or what greedy gemma-2b actually says is exactly
+     what `Tests/Oracle` is for, and it needs the GGUF the mirror does not
+     carry. That is now the top open question.
+
+   Timings, Debug, one M-series device, 16 tokens from a 6-token prompt: 38 s
+   to load and upload (the BF16 widening on the CPU, which is gap 1), 0.36 s
+   of prefill, and 0.29 s of decode — about 56 tokens/s.
 5. Performance rounds: the BF16 read lands in eacp first, since it decides the
    whole memory budget; then the fused GeGLU, the split counts (the decoder's
    64 and 32 are WhisperEACP's numbers, unmeasured on Gemma's widths), and
@@ -277,11 +337,15 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    above zero routes the loop through a 1 MB logits readback per token, one
    step in flight. `Apps/Console/Generate` streams a continuation for a prompt
    and prints the two halves' timings. On-device sampling is a later round.
-   Nothing above has touched the real checkpoint: it needs a download and
-   `GEMMA_MODEL_DIR`, and the first run against it is the next step.
 
 ## Open decisions
 
+- **Why does greedy gemma-2b not say Paris here?** The one failing test, and
+  the only question the tiers below it cannot answer on their own. Settling it
+  means the llama.cpp oracle over `gemma-2b.gguf`, which means Google's gated
+  download — so the next move is either doing that download once by hand and
+  pointing `GEMMA_MODEL_DIR` at it, or finding an ungated F32 GGUF of the same
+  weights the fetch could take.
 - Does the BF16 read go into eacp now, so this project never carries a widened
   fp32 path at all?
 - Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B? The

@@ -1,5 +1,7 @@
 #include "Common.h"
 
+#include "../Support/GemmaModel.h"
+
 using namespace nano;
 using namespace HF;
 using namespace HF::Testing;
@@ -34,8 +36,9 @@ std::string indexJson()
 const auto gemmaConfigJson = std::string {R"({"model_type":"gemma"})"};
 
 // A whole model directory: config.json, the index, and the two shards it
-// names. Written rather than fetched, which is the only way this suite runs
-// on a machine with no copy of a gated 5 GB repo.
+// names. Written rather than fetched, because the shard path needs a sharded
+// repo and the one the build fetches is a single 5 GB file — so the case that
+// would otherwise be untested is the one assembled here.
 class ShardedModel
 {
 public:
@@ -200,16 +203,20 @@ auto tModelFilesNamesWhatIsMissing = test("Model/Files/namesWhatIsMissing") = []
                            { return ModelFiles::fromDirectory(shardless.path()); }));
 };
 
-auto tModelFilesReadsTheEnvironment = test("Model/Files/readsTheEnvironment") = []
+// GEMMA_MODEL_DIR is the explicit override and nothing's default: unset — as
+// it is on a machine that runs the model the build fetched — it reads as
+// empty, and a caller then takes the build's own directory rather than a
+// search of somewhere plausible.
+auto tModelFilesReadsTheOverride = test("Model/Files/readsTheOverride") = []
 {
-    // GEMMA_MODEL_DIR is unset on a machine with no manual download, and that
-    // is a clear error rather than a search of somewhere plausible.
-    if (!ModelFiles::hasDirectoryInEnvironment())
+    const auto named = ModelFiles::directoryFromEnvironment();
+
+    if (named.empty())
     {
-        check(ModelFiles::directoryFromEnvironment().empty());
-        check(throwsModelError([] { return ModelFiles::fromEnvironment(); }));
+        check(gemmaModelDirectory()
+              == std::filesystem::path {HF_EACP_GEMMA_MODEL_DIR});
         return;
     }
 
-    check(!ModelFiles::directoryFromEnvironment().empty());
+    check(gemmaModelDirectory() == named);
 };

@@ -49,9 +49,9 @@
 // the argmax and the top five agree, the tolerance is what is wrong; if the
 // argmax disagrees, we are.
 //
-// Everything skips without a device, without GEMMA_MODEL_DIR, and without the
-// GGUF beside the safetensors — which is every machine this has been written
-// on.
+// Everything skips without a device, without a checkpoint, and without the
+// GGUF beside the safetensors — which the fetched mirror does not carry, so it
+// takes GEMMA_MODEL_DIR pointing at Google's own download.
 
 using namespace nano;
 using namespace HF;
@@ -91,15 +91,15 @@ const auto promptCases = std::vector<std::string> {
 
 bool canRun()
 {
-    return Device::shared().isValid() && ModelFiles::hasDirectoryInEnvironment()
-           && hasOracleModel() && hasOurTokenizer();
+    return Device::shared().isValid() && hasGemmaModel() && hasOracleModel()
+           && hasOurTokenizer();
 }
 
 // The numbers comparison needs neither the device nor ten gigabytes of
 // weights: it reads config.json and the GGUF's header and nothing else.
 bool canCompareNumbers()
 {
-    return ModelFiles::hasDirectoryInEnvironment() && hasOracleModel();
+    return hasGemmaModel() && hasOracleModel();
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ class OurDecoding
 {
 public:
     OurDecoding()
-        : files(ModelFiles::fromEnvironment())
+        : files(gemmaModelFiles())
         , modelConfig(GemmaConfig::fromModelFiles(files))
         , decoderShape(windowedShape(modelConfig))
         , weights(ShardedTensors::fromModelFiles(files), decoderShape)
@@ -582,8 +582,8 @@ auto tGreedyContinuationAgrees = test("Oracle/Decoder/greedyContinuationAgrees")
 // plan.md's "confirm every number against config.json", from the other side:
 // the GGUF's header was written by a conversion that read the same
 // config.json, so the two agreeing is what retires that caveat — and a
-// disagreement says the two files beside each other in GEMMA_MODEL_DIR are not
-// the same checkpoint, which is the first thing to rule out when a logit
+// disagreement says the two files beside each other in the model directory are
+// not the same checkpoint, which is the first thing to rule out when a logit
 // comparison fails.
 //
 // Cheap on purpose: no device, no decoder, no ten gigabytes. Five of the
@@ -602,7 +602,7 @@ auto tConfigMatchesGguf = test("Oracle/Decoder/configMatchesGguf") = []
     if (!oracle.isValid())
         return;
 
-    const auto config = GemmaConfig::fromModelFiles(ModelFiles::fromEnvironment());
+    const auto config = GemmaConfig::fromModelFiles(gemmaModelFiles());
 
     std::cout << "  llama.cpp calls it \"" << oracle.description() << "\"\n";
 

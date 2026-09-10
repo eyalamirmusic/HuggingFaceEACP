@@ -11,11 +11,10 @@
 // other byte reaches BPE as itself and a character with no piece of its own
 // leaves through ByteFallback.
 //
-// Every field here is read out of the model's tokenizer.json, because the
-// three that vary are exactly the ones this project could not confirm without
-// the gated file: see Tokenizer::fromJsonText for where each is read from, and
-// check them against the real tokenizer.json once GEMMA_MODEL_DIR points at a
-// downloaded gemma-2b.
+// Every field here is read out of the model's tokenizer.json rather than
+// assumed, because all three vary between the SentencePiece models that share
+// this layer — see Tokenizer::fromJsonText for where each is read from. What
+// gemma-2b's own file says is now known and is recorded on each field below.
 namespace HF
 {
 struct Metaspace
@@ -26,15 +25,15 @@ struct Metaspace
 
     // Whether one replacement is prepended to the text, so that a first word
     // is spelled the same as a word after a space. SentencePiece calls it the
-    // dummy prefix; Llama's tokenizer.json asks for it and Gemma is believed
-    // not to, which is why the default here is off.
+    // dummy prefix; Llama's tokenizer.json asks for it and gemma-2b's does
+    // not — its normalizer is a bare `Replace(" " -> "▁")` with no Prepend and
+    // no Metaspace component — which is why the default here is off.
     bool prependsDummyPrefix = false;
 
     // Whether BPE is run on each replacement-led word separately rather than
     // on the whole text at once. Only a merge rule that spans a word boundary
-    // can tell the two apart, and only a Metaspace pre-tokenizer asks for it —
-    // with a null pre_tokenizer, which is what Gemma is believed to have, the
-    // whole segment is one word.
+    // can tell the two apart, and only a Metaspace pre-tokenizer asks for it.
+    // gemma-2b's pre_tokenizer is null, so the whole segment is one word.
     bool splitsBeforeReplacement = false;
 
     std::string normalize(std::string_view text) const;

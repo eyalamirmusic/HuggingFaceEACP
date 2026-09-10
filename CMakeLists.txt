@@ -64,6 +64,7 @@ if (HF_EACP_CI_BUILD)
 endif ()
 
 include(HFTargetSetup)
+include(HFResources)
 
 if (PROJECT_IS_TOP_LEVEL)
     hf_default_setup()

@@ -1,9 +1,10 @@
 add_executable(Generate Main.cpp)
 target_link_libraries(Generate PRIVATE HuggingFaceEACP)
 
-# Nothing is copied beside this binary and nothing is fetched for it:
-# google/gemma-2b is gated, so the model is a manual download that
-# GEMMA_MODEL_DIR points at. The binary builds and runs without one and says so.
+# The model this runs by default, copied beside the binary after every link.
+# Called unconditionally: it is a no-op when the build fetched no model, and
+# Gemma::hasBundledModel() is what tells the run whether it has one.
+hf_bundle_model(Generate)
 
 set(BUNDLE_ID "com.eacp.huggingface.generate")
 

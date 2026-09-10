@@ -1,19 +1,20 @@
 #include "Common.h"
 
+#include "../Support/GemmaModel.h"
+
 #include <iostream>
 
-// The real google/gemma-2b files, which are a manual download and never a
-// commit: the repo is gated, so nothing in this build fetches them. Point
-// GEMMA_MODEL_DIR at a directory that has them and every test here runs;
-// leave it unset, as it is on this machine, and every one returns early — the
-// same shape as a GPU test returning early on an invalid device.
+// The real gemma-2b files, which are a download and never a commit: the build
+// fetches them, and GEMMA_MODEL_DIR names a checkpoint of your own instead.
+// Every test here returns early when neither is there — a build configured
+// with -DHF_EACP_FETCH_MODEL=OFF — the same shape as a GPU test returning
+// early on an invalid device.
 //
-// **plan.md's Gemma numbers are the released config as remembered rather than
-// read, and this suite is where that gets settled.** The shapes below are
-// taken from the checkpoint's own config.json, not from plan.md's table, so a
-// run against a real download tells us whether the two agree: a mismatch here
-// is a correction to plan.md and to GemmaConfig's defaults, not a bug in the
-// loader.
+// **plan.md's Gemma numbers were the released config as remembered rather than
+// read, and this suite is what settled it: they agree.** The shapes below are
+// still taken from the checkpoint's own config.json rather than from plan.md's
+// table, so the two stay independent — a mismatch here is a correction to
+// plan.md and to GemmaConfig's defaults, not a bug in the loader.
 
 using namespace nano;
 using namespace HF;
@@ -23,7 +24,7 @@ namespace
 {
 bool hasRealCheckpoint()
 {
-    return ModelFiles::hasDirectoryInEnvironment();
+    return hasGemmaModel();
 }
 } // namespace
 
@@ -32,7 +33,7 @@ auto tCheckpointFilesAreThere = test("Model/Checkpoint/filesAreThere") = []
     if (!hasRealCheckpoint())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
 
     check(!files.config.empty());
     check(!files.shards.empty());
@@ -53,7 +54,7 @@ auto tCheckpointGgufIsRecorded = test("Model/Checkpoint/ggufIsRecorded") = []
     if (!hasRealCheckpoint())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
 
     if (!files.hasGgufModel())
     {
@@ -71,7 +72,7 @@ auto tCheckpointConfig = test("Model/Checkpoint/config") = []
     if (!hasRealCheckpoint())
         return;
 
-    const auto config = GemmaConfig::fromModelFiles(ModelFiles::fromEnvironment());
+    const auto config = GemmaConfig::fromModelFiles(gemmaModelFiles());
 
     check(config.vocabularySize > 0);
     check(config.hiddenSize > 0);
@@ -108,7 +109,7 @@ auto tCheckpointMatchesTheCatalogue =
     if (!hasRealCheckpoint())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
     const auto config = GemmaConfig::fromModelFiles(files);
     const auto weights = ShardedTensors::fromModelFiles(files);
 
@@ -127,7 +128,7 @@ auto tCheckpointStorageIsBFloat = test("Model/Checkpoint/storageIsBFloat") = []
     if (!hasRealCheckpoint())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
     const auto config = GemmaConfig::fromModelFiles(files);
     const auto weights = ShardedTensors::fromModelFiles(files);
 
@@ -152,7 +153,7 @@ auto tCheckpointReadsATensor = test("Model/Checkpoint/readsATensor") = []
     if (!hasRealCheckpoint())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
     const auto config = GemmaConfig::fromModelFiles(files);
     const auto weights = ShardedTensors::fromModelFiles(files);
 

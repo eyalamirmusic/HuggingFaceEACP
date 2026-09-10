@@ -1,5 +1,7 @@
 #include "LlamaOracle.h"
 
+#include "../Support/GemmaModel.h"
+
 #include <HuggingFaceEACP/Model/ModelFiles.h>
 
 #include <ggml-backend.h>
@@ -135,9 +137,9 @@ std::string readString(const Write& write)
 }
 } // namespace
 
-std::filesystem::path LlamaOracle::pathFromEnvironment()
+std::filesystem::path LlamaOracle::ggufPath()
 {
-    const auto directory = ModelFiles::directoryFromEnvironment();
+    const auto directory = gemmaModelDirectory();
 
     if (directory.empty())
         return {};
@@ -147,7 +149,7 @@ std::filesystem::path LlamaOracle::pathFromEnvironment()
 
 bool LlamaOracle::isAvailable()
 {
-    const auto path = pathFromEnvironment();
+    const auto path = ggufPath();
 
     if (path.empty())
         return false;
@@ -158,7 +160,7 @@ bool LlamaOracle::isAvailable()
 
 LlamaOracle LlamaOracle::load(int contextSize)
 {
-    return LlamaOracle {pathFromEnvironment(), contextSize};
+    return LlamaOracle {ggufPath(), contextSize};
 }
 
 LlamaOracle::LlamaOracle(const std::filesystem::path& ggufFile, int contextSize)

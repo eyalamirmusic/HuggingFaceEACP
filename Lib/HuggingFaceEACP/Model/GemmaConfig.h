@@ -32,12 +32,12 @@ struct GenerationConfig
 // against, and the token ids the loop stops on.
 //
 // Every field has Gemma 2B's own value as its default, so a config that omits
-// one still describes the model it came from. **plan.md's numbers are the
-// released config as remembered rather than read — the repo is gated and was
-// not fetched — so the defaults here are unconfirmed and a real config.json
-// overrides each of them.** What is not defaulted is model_type: a config for
-// some other architecture parses into shapes that mean nothing, so it is an
-// error instead.
+// one still describes the model it came from. The defaults were plan.md's
+// remembered numbers and are now the file's: `Model/Checkpoint/config` reads
+// the fetched checkpoint and every one of them holds. A real config.json still
+// overrides each. What is not defaulted is model_type: a config for some other
+// architecture parses into shapes that mean nothing, so it is an error
+// instead.
 struct GemmaConfig
 {
     static constexpr auto noToken = -1;

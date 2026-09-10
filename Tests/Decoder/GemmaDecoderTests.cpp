@@ -1,13 +1,15 @@
 #include "ReferenceDecoder.h"
 
+#include "../Support/GemmaModel.h"
+
 #include <cmath>
 #include <iostream>
 #include <vector>
 
-// The real checkpoint, which nothing here has: google/gemma-2b is gated, this
-// machine has no copy, and a build cannot fetch one unauthenticated. So every
-// test below returns early until GEMMA_MODEL_DIR names a directory — plan.md's
-// fourth gap and its answer.
+// The real checkpoint: the gemma-2b the build fetched, or the one
+// GEMMA_MODEL_DIR names instead. Every test below returns early when neither
+// is there — a build configured with -DHF_EACP_FETCH_MODEL=OFF — the way they
+// all do without a device.
 //
 // It is a smoke test on purpose. What it says is that the loader, the shapes
 // and the whole recorded step survive contact with 18 layers of 2048 over a
@@ -50,10 +52,10 @@ bool everyValueIsFinite(const Vector<float>& values)
 
 auto tGemmaPromptRuns = test("Decoder/Gemma/promptRunsAndIsFinite") = []
 {
-    if (!Device::shared().isValid() || !ModelFiles::hasDirectoryInEnvironment())
+    if (!Device::shared().isValid() || !hasGemmaModel())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
     const auto config = GemmaConfig::fromModelFiles(files);
     const auto weightFile = ShardedTensors::fromModelFiles(files);
 
@@ -131,10 +133,10 @@ auto tGemmaPromptRuns = test("Decoder/Gemma/promptRunsAndIsFinite") = []
 // past their end at 256,000 columns.
 auto tGemmaStepCapacityIsEnforced = test("Decoder/Gemma/stepCapacityIsEnforced") = []
 {
-    if (!Device::shared().isValid() || !ModelFiles::hasDirectoryInEnvironment())
+    if (!Device::shared().isValid() || !hasGemmaModel())
         return;
 
-    const auto files = ModelFiles::fromEnvironment();
+    const auto files = gemmaModelFiles();
     const auto config = GemmaConfig::fromModelFiles(files);
 
     auto shape = DecoderShape::fromConfig(config);

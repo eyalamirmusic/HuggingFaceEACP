@@ -58,13 +58,23 @@ int tokenFieldOr(const Miro::Json::Object& object,
     return static_cast<int>(id);
 }
 
+// The real gemma-2b config.json carries `"hidden_activation": null` beside a
+// `"hidden_act": "gelu"`, which is what transformers writes when the newer key
+// was never set — and it reads that null as Gemma's own gelu_pytorch_tanh with
+// `hidden_act` ignored, logging exactly that. So an explicit null is the
+// default rather than a missing key falling through to the older one, and only
+// an absent key defers to `hidden_act`.
 std::string activationOf(const Miro::Json::Object& object,
                          const std::string& fallback)
 {
-    const auto older =
-        ModelIO::stringFieldOr(object, "hidden_act", fallback, configName);
+    if (const auto* named = Miro::Json::find(object, "hidden_activation");
+        named != nullptr)
+        return named->isNull()
+                   ? fallback
+                   : ModelIO::stringFieldOr(
+                         object, "hidden_activation", fallback, configName);
 
-    return ModelIO::stringFieldOr(object, "hidden_activation", older, configName);
+    return ModelIO::stringFieldOr(object, "hidden_act", fallback, configName);
 }
 } // namespace
 

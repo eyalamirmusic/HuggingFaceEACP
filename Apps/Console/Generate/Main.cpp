@@ -13,10 +13,11 @@
 // The whole runtime as a binary: a prompt in, a continuation streamed out as
 // each token arrives, and what the two halves of the run cost on stderr.
 //
-// The model is not shipped and is not fetched. google/gemma-2b is gated — an
-// account that accepted Google's terms and a token — so it is a manual download
-// and GEMMA_MODEL_DIR is what points at it, which is plan.md's fourth gap and
-// its answer. This binary builds and runs without one and says so.
+// The model ships with the binary: the build fetches gemma-2b and copies it
+// beside this executable, and a run with no arguments but a prompt loads that.
+// GEMMA_MODEL_DIR is the explicit override, and it wins when set — which is
+// how a run is pointed at Google's own gated download, the one that carries
+// gemma-2b.gguf beside the safetensors for the oracle tests.
 //
 // Inside eacp::Apps::run for the reason every GPU-touching thing here is: the
 // Metal backend is written against the run loop and autorelease pool that owns,
@@ -35,16 +36,17 @@ constexpr auto usage =
     "  --top-p P        keep the smallest set reaching mass P (default: 1)\n"
     "  --seed S         the draw's seed, so a run is reproducible\n"
     "\n"
-    "The model comes from the GEMMA_MODEL_DIR environment variable, which\n"
-    "names a downloaded google/gemma-2b directory: config.json, the\n"
-    "safetensors shards with their index, and tokenizer.json. The repo is\n"
-    "gated, so nothing in this build fetches it.\n";
+    "The model is the gemma-2b the build copied beside this binary. Set\n"
+    "GEMMA_MODEL_DIR to run a checkpoint of your own instead: a directory\n"
+    "with config.json, the weights as one safetensors or as shards behind an\n"
+    "index, and tokenizer.json. It wins over the copy whenever it is set.\n";
 
-std::string missingModelDirectory()
+std::string missingModel()
 {
-    return "GEMMA_MODEL_DIR is not set, so there is no model to run.\n"
-           "Download google/gemma-2b once by hand and point the variable at\n"
-           "the directory:\n\n"
+    return "this binary ships no model, so there is nothing to run.\n"
+           "Reconfigure with -DHF_EACP_FETCH_MODEL=ON — the default — so the\n"
+           "build fetches gemma-2b and copies it beside the binary, or point\n"
+           "GEMMA_MODEL_DIR at a checkpoint of your own:\n\n"
            "  export GEMMA_MODEL_DIR=/path/to/gemma-2b\n\n";
 }
 
@@ -142,7 +144,13 @@ void run(const Request& request)
     const auto start = std::chrono::steady_clock::now();
 
     auto gemma = HF::Gemma {};
-    gemma.loadFromEnvironment();
+
+    if (const auto named = HF::ModelFiles::directoryFromEnvironment();
+        !named.empty())
+        gemma.load(named);
+    else
+        gemma.loadBundled();
+
     gemma.prepare();
 
     if (request.maximumTokens > 0)
@@ -185,9 +193,10 @@ void generate()
         return;
     }
 
-    if (!HF::ModelFiles::hasDirectoryInEnvironment())
+    if (HF::ModelFiles::directoryFromEnvironment().empty()
+        && !HF::Gemma::hasBundledModel())
     {
-        std::fputs(missingModelDirectory().c_str(), stderr);
+        std::fputs(missingModel().c_str(), stderr);
         std::fputs(usage, stderr);
         Apps::setReturnValue(2);
         return;

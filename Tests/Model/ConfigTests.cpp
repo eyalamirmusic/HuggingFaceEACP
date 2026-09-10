@@ -99,6 +99,15 @@ auto tConfigActivationKeys = test("Model/Config/activationKeys") = []
         R"({"model_type":"gemma","hidden_activation":"gelu_pytorch_tanh",)"
         R"("hidden_act":"gelu"})");
     check(both.hiddenActivation == "gelu_pytorch_tanh");
+
+    // And the shape the real gemma-2b config.json is in: an explicit null on
+    // the newer key beside a string on the older one. transformers writes that
+    // when the newer key was never set, and reads it as Gemma's own
+    // gelu_pytorch_tanh with `hidden_act` ignored — so the null is the
+    // default, not a missing key deferring to "gelu".
+    const auto nulled = GemmaConfig::fromJson(
+        R"({"model_type":"gemma","hidden_activation":null,"hidden_act":"gelu"})");
+    check(nulled.hiddenActivation == "gelu_pytorch_tanh");
 };
 
 // A decoder built for gemma and pointed at some other architecture's config

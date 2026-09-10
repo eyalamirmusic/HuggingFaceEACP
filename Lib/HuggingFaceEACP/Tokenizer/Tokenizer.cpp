@@ -132,11 +132,11 @@ void forEachComponent(const Value* node,
     visit(*node);
 }
 
-// The three metaspace properties this project could not confirm against the
-// real gemma-2b tokenizer.json, each read from wherever the fast tokenizer
-// expresses it. Check every one of them once GEMMA_MODEL_DIR points at a
-// downloaded model: what is here is HuggingFace's own defaults, not a guess
-// about which of them Gemma uses.
+// The three metaspace properties, each read from wherever the fast tokenizer
+// expresses it rather than assumed — what a file does not name falls back to
+// HuggingFace's own default. gemma-2b's file names one of the three: a
+// `Replace(" " -> "▁")` normalizer, with a null pre_tokenizer and no Prepend,
+// so the dummy prefix and the split are both off.
 void readMetaspaceComponent(const Value& component, Metaspace& metaspace)
 {
     const auto type = stringOr(component, "type", {});

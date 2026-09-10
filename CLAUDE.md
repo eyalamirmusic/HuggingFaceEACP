@@ -19,14 +19,17 @@ belongs in eacp rather than in a workaround here. `plan.md` is the plan — the
 model's shape, what carries over from WhisperEACP, what is new, and the ranked
 list of eacp gaps — and is the file to read before adding anything.
 
-Right now this runs end to end at the synthetic scale: `Core`, the `Model`
+Right now this runs end to end against the real checkpoint: `Core`, the `Model`
 loader with its shard index and Gemma config, the `Tokenizer`, `Kernels` — the
 op set each kernel is checked against a scalar CPU reference — the `Decoder`
 that is Gemma's forward pass over a KV cache, the CPU `Sampling`, and
-`Generation`, the KV-cached loop that takes a string and returns one. What is
-missing is the run against the real checkpoint: the repo is gated and there is
-no download on this machine, so every test against it returns early and the
-`Generate` app says so until `GEMMA_MODEL_DIR` points at one.
+`Generation`, the KV-cached loop that takes a string and returns one. The
+weights are a build-time download rather than something to arrange by hand:
+`HF_EACP_FETCH_MODEL` fetches gemma-2b at configure time and
+`hf_bundle_model(<target>)` copies it beside a binary, which `Generate` and
+`Tests/Bundled` both call. `GEMMA_MODEL_DIR` is the explicit override, for a
+checkpoint of your own — Google's gated download among them, which is the one
+that carries the `gemma-2b.gguf` `Tests/Oracle` reads.
 
 ## Build Commands
 
@@ -56,12 +59,39 @@ ctest --test-dir build --output-on-failure
 - `HF_EACP_ENABLE_TESTS` / `HF_EACP_ENABLE_APPS` (default: on when top-level):
   the `Tests/` and `Apps/` trees.
 
+- `HF_EACP_FETCH_MODEL` (default `ON`): CPM downloads gemma-2b's four files at
+  configure time and links them into `<build>/gemma-2b`, which
+  `hf_bundle_model(<target>)` then copies beside the binaries that ask —
+  `Generate` and `BundledTests` — and which every test target sees as the
+  `HF_EACP_GEMMA_MODEL_DIR` compile definition.
+
+  The source is **`unsloth/gemma-2b`**, pinned to a commit, not
+  `google/gemma-2b`: Google's repo is gated, so an unauthenticated download of
+  any file in it answers HTTP 401 and CPM cannot fetch it. unsloth's is an
+  ungated mirror of the same bf16 weights — one unsharded `model.safetensors`,
+  the same tokenizer, the same config numbers. What it does not carry is
+  `gemma-2b.gguf`, so `Tests/Oracle` still wants Google's own download through
+  `GEMMA_MODEL_DIR`.
+
+  It costs disk twice over. The download itself is 5.0 GB of
+  `model.safetensors` plus 17.5 MB of `tokenizer.json` and under a kilobyte of
+  the two JSON configs, and it lands in `build/_deps` — set `CPM_SOURCE_CACHE`
+  to a directory outside the build tree and every build directory on the
+  machine shares one copy instead of re-downloading 5 GB each. On top of that
+  each `hf_bundle_model` target gets a **copy**, not a link, so `Generate` and
+  `BundledTests` are 5 GB apiece beside their executables — about 15 GB for a
+  full build tree. Configure with `-DHF_EACP_FETCH_MODEL=OFF` for a build that
+  only wants the library; the tests that need a checkpoint then skip the way a
+  GPU test skips without a device.
+
 - `HF_EACP_ENABLE_LLAMA_CPP` (default `OFF`): fetches llama.cpp at a pinned
   release tag and builds `Tests/Oracle`, which compares our tokens and our
   logits against it. Off by default because both halves are expensive in a way
   the rest of this build is not — llama.cpp and ggml are minutes of compile,
-  and the `gemma-2b.gguf` the tests read is a 10 GB manual download, so every
-  test there skips without one. It means nothing without
+  and the `gemma-2b.gguf` the tests read is a 10 GB manual download that the
+  fetched mirror does not carry, so it takes `GEMMA_MODEL_DIR` pointing at
+  Google's own gated download and every test there skips without one. It means
+  nothing without
   `HF_EACP_ENABLE_TESTS`. The fetch names every ggml backend off, so the
   reference is exactly ggml's CPU arithmetic and a disagreement cannot be a
   backend's.
@@ -169,17 +199,18 @@ runs against MSL on Apple and HLSL on Windows.
 | | |
 | --- | --- |
 | `plan.md` | The plan: Gemma 2B's shape, what carries over from WhisperEACP, and the ranked eacp gaps |
-| `CMake` | `CPM.cmake`, the two `Find` modules that fetch eacp and NanoTest, and `HFTargetSetup.cmake` |
+| `CMake` | `CPM.cmake`, the two `Find` modules that fetch eacp and NanoTest, `HFTargetSetup.cmake` and `HFResources.cmake` |
 | `Lib/HuggingFaceEACP/Core` | Shared types and the library version. Links `eacp-gpu` |
-| `Lib/HuggingFaceEACP/Model` | Safetensors with the shard index, `config.json`, the tensor catalogue, and the `GEMMA_MODEL_DIR` locator |
+| `Lib/HuggingFaceEACP/Model` | Safetensors with the shard index, `config.json`, the tensor catalogue, the `GEMMA_MODEL_DIR` override, and the model fetch with `hf_bundle_model` |
 | `Lib/HuggingFaceEACP/Tokenizer` | Gemma's SentencePiece-style BPE from `tokenizer.json`, with byte fallback |
 | `Lib/HuggingFaceEACP/Kernels` | The op set: the products, the reductions, RMSNorm, RoPE, GeGLU and the multi-query attention |
 | `Lib/HuggingFaceEACP/Decoder` | Gemma's forward pass over a KV cache: the shape, the weights, and one compute pass per step |
 | `Lib/HuggingFaceEACP/Sampling` | The CPU sampler over a read-back logits row: greedy, temperature, top-k, top-p |
-| `Lib/HuggingFaceEACP/Generation` | `Gemma`: the whole runtime, a string in and a string out, with the greedy loop's token feedback on the device |
+| `Lib/HuggingFaceEACP/Generation` | `Gemma`: the whole runtime, a string in and a string out, with the greedy loop's token feedback on the device; and `resourcesDirectory()`, which finds the model the build copied |
 | `Apps/Console/DeviceInfo` | What this machine's GPU offers, printed from eacp's `Device` |
-| `Apps/Console/Generate` | A prompt in and a continuation streamed out, over the model `GEMMA_MODEL_DIR` names |
+| `Apps/Console/Generate` | A prompt in and a continuation streamed out, over the model the build copied beside it, or the one `GEMMA_MODEL_DIR` names |
 | `Tests/Core` | The version, without a device |
+| `Tests/Bundled` | What `hf_bundle_model` put beside the binary: the copy matches the fetch, and a run out of it generates |
 | `Tests/GPU` | The compute smoke test: eacp's toolchain end to end |
 | `Tests/Model` | Shards and config over safetensors files the tests write themselves |
 | `Tests/Tokenizer` | A hand-written mini `tokenizer.json` fixture |
@@ -188,7 +219,7 @@ runs against MSL on Apple and HLSL on Windows.
 | `Tests/Sampling` | Greedy, temperature, top-k and top-p on the CPU, seeded and reproducible |
 | `Tests/Generation` | The loop against one the test runs itself, over the synthetic checkpoint and a `tokenizer.json` of the same width |
 | `Tests/Oracle` | llama.cpp over the F32 GGUF, behind `HF_EACP_ENABLE_LLAMA_CPP` |
-| `Tests/Support` | `GpuTestMain.cpp`, the shared entry point for GPU-touching suites |
+| `Tests/Support` | `GpuTestMain.cpp`, the shared entry point for GPU-touching suites, and `GemmaModel.h`, which resolves the checkpoint every suite runs against |
 
 ## Code Style
 

@@ -136,9 +136,9 @@ auto tCatalogueShapes = test("Model/Catalogue/shapes") = []
 };
 
 // Gemma 2B's own numbers, so the catalogue is checked against plan.md's table
-// rather than only against itself. Unconfirmed against the real config.json —
-// the repo is gated and was not fetched — and CheckpointTests is where a real
-// download would say so.
+// rather than only against itself. CheckpointTests next door runs the same
+// catalogue against the fetched checkpoint, which is what says the table and
+// the file agree.
 auto tCatalogueAtGemmaSize = test("Model/Catalogue/atGemmaSize") = []
 {
     const auto config = GemmaConfig {};

@@ -1,5 +1,7 @@
 #include "Gemma.h"
 
+#include "ResourcesDirectory.h"
+
 #include <HuggingFaceEACP/Model/ModelError.h>
 
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <system_error>
 
 namespace HF
 {
@@ -26,6 +29,12 @@ constexpr auto slotBytes = (int) sizeof(std::uint32_t);
 constexpr int floatBytes(int elementCount)
 {
     return elementCount * (int) sizeof(float);
+}
+
+bool isFile(const std::filesystem::path& path)
+{
+    auto error = std::error_code {};
+    return std::filesystem::is_regular_file(path, error);
 }
 
 using Clock = std::chrono::steady_clock;
@@ -73,9 +82,40 @@ void Gemma::load(const ModelFiles& files)
     maximumTokenCount = 0;
 }
 
-void Gemma::loadFromEnvironment()
+std::filesystem::path Gemma::bundledModelDirectory()
 {
-    load(ModelFiles::fromEnvironment());
+    return resourcesDirectory() / bundledModelDirectoryName;
+}
+
+bool Gemma::hasBundledModel()
+{
+    const auto directory = bundledModelDirectory();
+
+    const auto hasWeights = isFile(directory / ModelFileNames::weights)
+                            || isFile(directory / ModelFileNames::shardIndex);
+
+    return isFile(directory / ModelFileNames::config) && hasWeights
+           && isFile(directory / ModelFileNames::tokenizerJson);
+}
+
+// No directory at all is a build that never asked for the copy, and the
+// message says how to ask. One that is there but short a file is a copy that
+// did not finish, and load() names the file the way it would for any
+// directory.
+void Gemma::loadBundled()
+{
+    const auto directory = bundledModelDirectory();
+    auto error = std::error_code {};
+
+    if (!std::filesystem::is_directory(directory, error))
+        throw ModelError {"this binary ships no model: there is no "
+                          + directory.string()
+                          + "; a model is copied there by calling "
+                            "hf_bundle_model(<target>) in the target's "
+                            "CMakeLists, in a build configured with "
+                            "-DHF_EACP_FETCH_MODEL=ON"};
+
+    load(directory);
 }
 
 // ModelFiles records the tokenizer without requiring it, because a caller

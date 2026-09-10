@@ -104,21 +104,4 @@ std::filesystem::path ModelFiles::directoryFromEnvironment()
 
     return {value};
 }
-
-bool ModelFiles::hasDirectoryInEnvironment()
-{
-    return !directoryFromEnvironment().empty();
-}
-
-ModelFiles ModelFiles::fromEnvironment()
-{
-    const auto directory = directoryFromEnvironment();
-
-    if (directory.empty())
-        throw ModelError {std::string {modelDirectoryVariable}
-                          + " is not set: download google/gemma-2b by hand and "
-                            "point it at the directory"};
-
-    return fromDirectory(directory);
-}
 } // namespace HF

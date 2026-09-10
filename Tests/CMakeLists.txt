@@ -7,7 +7,15 @@ find_package(NanoTest REQUIRED)
 # SOURCES beside NO_MAIN rather than keeping a copy of its own.
 set(HF_GPU_TEST_MAIN "${CMAKE_CURRENT_LIST_DIR}/Support/GpuTestMain.cpp")
 
+# The directory Lib/HuggingFaceEACP/Model assembled the fetched gemma-2b into,
+# to every test target at once: Support/GemmaModel.h is what reads it, and
+# which suite wants a real checkpoint changes often enough that naming them one
+# by one is a list to forget to add to. Empty of files rather than empty as a
+# path when the fetch is off, which is why the helper asks the filesystem.
+add_compile_definitions(HF_EACP_GEMMA_MODEL_DIR="${HF_EACP_GEMMA_MODEL_DIR}")
+
 add_subdirectory(Core)
+add_subdirectory(Bundled)
 add_subdirectory(GPU)
 add_subdirectory(Model)
 add_subdirectory(Tokenizer)

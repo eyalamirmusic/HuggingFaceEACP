@@ -25,10 +25,13 @@ inline constexpr auto tokenizerModel = "tokenizer.model";
 inline constexpr auto ggufModel = "gemma-2b.gguf";
 } // namespace ModelFileNames
 
-// google/gemma-2b is a gated repo: downloading it needs an account that
-// accepted Google's terms and a token, so nothing here fetches anything. This
-// is plan.md's fourth gap and its answer — the user downloads the repo once by
-// hand and points this variable at the directory.
+// The explicit override, and nothing's default. The build fetches gemma-2b
+// from an ungated mirror and copies it beside every binary that asks — see
+// Model/CMakeLists.txt and Gemma::loadBundled — so a run needs nothing set.
+// This variable is how a caller names a checkpoint of its own instead: a
+// checkout of Google's own gated repo, which is the download that carries
+// gemma-2b.gguf beside the safetensors for Tests/Oracle, or any other Gemma
+// directory. Set, it wins over what the build copied.
 inline constexpr auto modelDirectoryVariable = "GEMMA_MODEL_DIR";
 
 // A model directory that has been looked at: every path below either names a
@@ -58,12 +61,8 @@ struct ModelFiles
     // Throws a ModelError naming the directory and the file it wanted.
     static ModelFiles fromDirectory(const std::filesystem::path& directory);
 
-    // Empty when GEMMA_MODEL_DIR is unset or set to nothing, which is what a
-    // test skipping on the absence of the real model asks about.
+    // Empty when GEMMA_MODEL_DIR is unset or set to nothing, which is a run
+    // taking the model the build assembled rather than one of its own.
     static std::filesystem::path directoryFromEnvironment();
-    static bool hasDirectoryInEnvironment();
-
-    // The same checks as fromDirectory, plus one for the variable itself.
-    static ModelFiles fromEnvironment();
 };
 } // namespace HF

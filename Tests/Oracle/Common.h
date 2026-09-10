@@ -4,12 +4,16 @@
 // load: llama.cpp over gemma-2b.gguf on one side, our own modules over the
 // files beside it on the other.
 //
-// The GGUF is a 10 GB manual download from a gated repo, so on a machine
-// without one every test here returns early — the same shape as a GPU test
-// returning early when Device::shared().isValid() is false. The skip says so
-// once rather than per test, because a silent pass and a real pass look alike.
+// The GGUF is a 10 GB manual download and the one file the fetched mirror does
+// not carry — it comes with Google's own gated repo, which GEMMA_MODEL_DIR is
+// how a machine that has done that download names. So on a machine without one
+// every test here returns early, the same shape as a GPU test returning early
+// when Device::shared().isValid() is false. The skip says so once rather than
+// per test, because a silent pass and a real pass look alike.
 
 #include "LlamaOracle.h"
+
+#include "../Support/GemmaModel.h"
 
 #include <HuggingFaceEACP/Model/ModelFiles.h>
 #include <HuggingFaceEACP/Tokenizer/Tokenizer.h>
@@ -23,14 +27,14 @@
 
 namespace HF::Testing
 {
-// Spelled out of the directory rather than through ModelFiles::fromEnvironment
-// because that one requires a whole checkpoint: it throws on a directory with
-// no config.json, and the tokenizer comparison below has no use for the
-// weights. The names still come from ModelFileNames, so there is one spelling
-// of each file in the project.
+// Spelled out of the directory rather than through gemmaModelFiles() because
+// that one requires a whole checkpoint: it throws on a directory with no
+// config.json, and the tokenizer comparison below has no use for the weights.
+// The names still come from ModelFileNames, so there is one spelling of each
+// file in the project.
 inline std::filesystem::path modelFile(std::string_view name)
 {
-    const auto directory = ModelFiles::directoryFromEnvironment();
+    const auto directory = gemmaModelDirectory();
     return directory.empty() ? std::filesystem::path {} : directory / name;
 }
 
@@ -49,8 +53,11 @@ inline void announceSkip()
 {
     static const auto announced = []
     {
-        std::cout << "  no " << ModelFileNames::ggufModel << " under "
-                  << modelDirectoryVariable << ": the llama.cpp oracle tests skip\n";
+        std::cout << "  no " << ModelFileNames::ggufModel << " in "
+                  << gemmaModelDirectory().string()
+                  << ": the llama.cpp oracle tests skip. It comes with Google's "
+                     "own gated download, which "
+                  << modelDirectoryVariable << " points at\n";
 
         return true;
     }();

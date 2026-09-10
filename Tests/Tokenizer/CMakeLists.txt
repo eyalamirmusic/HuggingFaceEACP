@@ -1,19 +1,16 @@
+# hf-model beside hf-tokenizer, for Support/GemmaModel.h alone: the tokenizer
+# knows nothing about a checkpoint's layout, and ModelFiles is what spells the
+# file names and reads the GEMMA_MODEL_DIR override. A test dependency only —
+# hf-tokenizer's own is unchanged.
 nano_add_executable(TokenizerTests
         SOURCES
         TokenizerTests.cpp
-        TARGETS hf-tokenizer)
+        TARGETS hf-tokenizer hf-model)
 
-# gemma-2b is gated and its tokenizer.json is 17.5 MB, so it is a manual
-# download and never a commit: the test that wants one returns early when it is
-# absent, the way the GPU tests do without a device. Point it at a downloaded
-# model with the GEMMA_MODEL_DIR environment variable at run time, or with this
-# at configure time. plan.md's item 4 is the same directory.
-#
-# The committed fixture beside it is reached by absolute path rather than by
-# guessing a working directory.
-set(HF_EACP_GEMMA_MODEL_DIR "" CACHE PATH
-        "A downloaded google/gemma-2b directory to run the tokenizer tests against")
-
+# The hand-written mini vocabulary this suite is mostly written against, reached
+# by absolute path rather than by guessing a working directory. gemma-2b's own
+# 17.5 MB tokenizer.json is a download and never a commit, and it arrives
+# through HF_EACP_GEMMA_MODEL_DIR, which Tests/CMakeLists.txt defines for every
+# target here.
 target_compile_definitions(TokenizerTests PRIVATE
-        HF_TOKENIZER_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/Fixtures"
-        HF_EACP_GEMMA_MODEL_DIR="${HF_EACP_GEMMA_MODEL_DIR}")
+        HF_TOKENIZER_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/Fixtures")

@@ -1,12 +1,14 @@
 #include "Common.h"
 
+#include "../Support/GemmaModel.h"
+
 #include <iostream>
 #include <string>
 
-// The real checkpoint, which nothing here has: google/gemma-2b is gated, this
-// machine has no copy, and a build cannot fetch one unauthenticated. So every
-// test below returns early until GEMMA_MODEL_DIR names a directory — plan.md's
-// fourth gap and its answer.
+// The real checkpoint: the gemma-2b the build fetched, or the one
+// GEMMA_MODEL_DIR names instead. Every test below returns early when neither
+// is there — a build configured with -DHF_EACP_FETCH_MODEL=OFF — the way they
+// all do without a device.
 //
 // This is the first test in the tree that asserts something about what the
 // model *says* rather than about a number: a base completion model given "The
@@ -24,7 +26,7 @@ namespace
 {
 bool hasRealCheckpoint()
 {
-    return Device::shared().isValid() && ModelFiles::hasDirectoryInEnvironment();
+    return Device::shared().isValid() && hasGemmaModel();
 }
 
 // Small enough that a first run is seconds rather than a minute, and long
@@ -51,7 +53,7 @@ auto tGemmaGeneratesText = test("Generation/Gemma/completesAPrompt") = []
         return;
 
     auto gemma = Gemma {};
-    gemma.loadFromEnvironment();
+    gemma.load(gemmaModelDirectory());
 
     check(gemma.isLoaded());
     check(gemma.config().vocabularySize == 256000);
@@ -91,7 +93,7 @@ auto tGemmaSampledPathAgrees = test("Generation/Gemma/sampledPathAgrees") = []
         return;
 
     auto gemma = Gemma {};
-    gemma.loadFromEnvironment();
+    gemma.load(gemmaModelDirectory());
     gemma.prepare();
 
     gemma.setMaximumTokens(4);
@@ -120,7 +122,7 @@ auto tGemmaBlockedPrefillAgrees = test("Generation/Gemma/blockedPrefillAgrees") 
         "Paris is the capital of France, and Rome is the capital of";
 
     auto whole = Gemma {};
-    whole.loadFromEnvironment();
+    whole.load(gemmaModelDirectory());
     whole.prepare();
     whole.setMaximumTokens(4);
 
@@ -128,7 +130,7 @@ auto tGemmaBlockedPrefillAgrees = test("Generation/Gemma/blockedPrefillAgrees") 
     check(whole.lastStepCount() == 1 + unblocked.size() - 1);
 
     auto blocked = Gemma {};
-    blocked.loadFromEnvironment();
+    blocked.load(gemmaModelDirectory());
     blocked.setPromptCapacity(4);
     blocked.prepare();
     blocked.setMaximumTokens(4);

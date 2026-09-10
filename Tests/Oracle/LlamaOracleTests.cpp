@@ -13,7 +13,9 @@
 // one end-to-end claim about the model's behaviour with it: greedy decoding
 // from "The capital of France is" reaches Paris.
 //
-// Everything skips without GEMMA_MODEL_DIR/gemma-2b.gguf.
+// Everything skips without gemma-2b.gguf, which comes with Google's own gated
+// download rather than with the mirror the build fetches — GEMMA_MODEL_DIR is
+// how a machine that has done that download names it.
 
 using namespace nano;
 using namespace HF;

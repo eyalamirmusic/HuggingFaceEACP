@@ -11,8 +11,9 @@
 // is not a claim the fp16 GGML files most models ship can support.
 //
 // Everything skips on a missing file, the same shape as a GPU test returning
-// early when Device::shared().isValid() is false: the GGUF is 10 GB and the
-// repo is gated, so it is a manual download and never a commit.
+// early when Device::shared().isValid() is false: the GGUF is 10 GB, and the
+// ungated mirror the build fetches has no copy of it, so it is a manual
+// download out of Google's own gated repo and never a commit.
 
 #include <HuggingFaceEACP/Core/Core.h>
 #include <HuggingFaceEACP/Tokenizer/SpecialTokens.h>
@@ -37,10 +38,11 @@ public:
 
     static bool isAvailable();
 
-    // GEMMA_MODEL_DIR/gemma-2b.gguf, which is empty when the variable is
-    // unset. Named separately from isAvailable() so a failure can say which
-    // file it wanted.
-    static std::filesystem::path pathFromEnvironment();
+    // gemma-2b.gguf in the model directory the tests resolve — the
+    // GEMMA_MODEL_DIR override, else the one the build assembled, which is a
+    // mirror without the GGUF. Named separately from isAvailable() so a
+    // failure can say which file it wanted.
+    static std::filesystem::path ggufPath();
 
     static LlamaOracle load(int contextSize = defaultContextSize);
 

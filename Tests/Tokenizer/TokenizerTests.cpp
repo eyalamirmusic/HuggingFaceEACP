@@ -1,3 +1,5 @@
+#include "../Support/GemmaModel.h"
+
 #include <HuggingFaceEACP/Tokenizer/Tokenizer.h>
 
 #include <Miro/Json.h>
@@ -6,7 +8,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -99,23 +100,14 @@ bool fileExists(const std::filesystem::path& path)
     return !path.empty() && std::filesystem::is_regular_file(path, error);
 }
 
-// The real tokenizer.json is 17.5 MB and lives in a gated repo, so it is a
-// manual download and never a commit: the test that wants one returns early
-// when none is there, the way the GPU tests do without a device. Point it at a
-// downloaded gemma-2b with the GEMMA_MODEL_DIR environment variable, or with
-// -DHF_EACP_GEMMA_MODEL_DIR=<path> at configure time.
+// The real tokenizer.json is 17.5 MB and never a commit, so it comes from the
+// gemma-2b the build fetched, or from the GEMMA_MODEL_DIR override — which is
+// what Testing::gemmaModelDirectory() resolves. The test that wants one still
+// returns early when the fetch was off, the way the GPU tests do without a
+// device.
 std::filesystem::path realTokenizerPath()
 {
-    if (const auto* fromEnvironment = std::getenv("GEMMA_MODEL_DIR"))
-    {
-        const auto inDirectory =
-            std::filesystem::path {fromEnvironment} / "tokenizer.json";
-
-        if (fileExists(inDirectory))
-            return inDirectory;
-    }
-
-    return std::filesystem::path {HF_EACP_GEMMA_MODEL_DIR} / "tokenizer.json";
+    return Testing::gemmaModelDirectory() / ModelFileNames::tokenizerJson;
 }
 } // namespace
 
@@ -322,9 +314,10 @@ auto tEncodeWithBos = test("Tokenizer/encodeWithBos") = []
 
 // --- What the JSON decides ----------------------------------------------
 
-// The dummy prefix and the word split are the two properties this project
-// could not confirm against the gated file, so both are read from the JSON
-// rather than assumed. Same text, same vocabulary, three spellings.
+// The dummy prefix and the word split vary between the SentencePiece models
+// that share this layer, so both are read from the JSON rather than assumed —
+// gemma-2b's own file turns both off. Same text, same vocabulary, three
+// spellings.
 auto tMetaspaceOptionsComeFromTheJson =
     test("Tokenizer/metaspaceOptionsComeFromTheJson") = []
 {
@@ -423,10 +416,35 @@ auto tRealTokenizerParseTime = test("Tokenizer/realTokenizerParseTime") = []
     check(tokenizer.unk() == 3);
     check(tokenizer.vocabularySize() >= 256000);
 
+    // Every byte reaches a piece that stands for exactly it, which is what
+    // byte fallback is for — and not that every byte has a `<0xNN>` piece,
+    // which the real vocabulary turns out not to hold. 255 of the 256 are
+    // there at 217..472; id 226, where `<0x09>` would sit, is a literal tab
+    // instead, so a tab goes through its own piece and the other 255 through
+    // the fallback.
+    //
+    // A byte below 0x80 is a character on its own, so the claim there is the
+    // whole round trip. One above is not — a lone continuation or lead byte is
+    // not UTF-8, and decode replaces an undecodable run with U+FFFD rather
+    // than handing back invalid text, which Tokenizer/decodesIncompleteByteRuns
+    // is about — so the claim is that it reaches its own byte piece, and the
+    // characters below are where such bytes come back through it.
     for (auto byte = 0; byte < 256; ++byte)
     {
-        const auto name = ByteFallback::nameForByte((std::uint8_t) byte);
-        check(tokenizer.tokenForText(name) != invalidTokenId);
+        const auto one = std::string(1, (char) byte);
+
+        if (byte < 0x80)
+        {
+            check(roundTrips(tokenizer, one));
+            continue;
+        }
+
+        const auto tokens = tokenizer.encode(one);
+
+        check(tokens.size() == 1);
+        check(tokens.size() == 1
+              && tokenizer.textForToken(tokens[0])
+                     == ByteFallback::nameForByte((std::uint8_t) byte));
     }
 
     const auto sentence =
