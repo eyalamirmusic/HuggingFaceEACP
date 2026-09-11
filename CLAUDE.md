@@ -28,8 +28,9 @@ weights are a build-time download rather than something to arrange by hand:
 `HF_EACP_FETCH_MODEL` fetches gemma-2b at configure time and
 `hf_bundle_model(<target>)` copies it beside a binary, which `Generate` and
 `Tests/Bundled` both call. `GEMMA_MODEL_DIR` is the explicit override, for a
-checkpoint of your own — Google's gated download among them, which is the one
-that carries the `gemma-2b.gguf` `Tests/Oracle` reads.
+checkpoint of your own — one with the `gemma-2b.gguf` `Tests/Oracle` reads
+beside the safetensors among them, which llama.cpp's own converter writes from
+the fetched mirror (see `plan.md`).
 
 ## Build Commands
 
@@ -70,8 +71,9 @@ ctest --test-dir build --output-on-failure
   any file in it answers HTTP 401 and CPM cannot fetch it. unsloth's is an
   ungated mirror of the same bf16 weights — one unsharded `model.safetensors`,
   the same tokenizer, the same config numbers. What it does not carry is
-  `gemma-2b.gguf`, so `Tests/Oracle` still wants Google's own download through
-  `GEMMA_MODEL_DIR`.
+  `gemma-2b.gguf`, which `Tests/Oracle` reads through `GEMMA_MODEL_DIR`: a
+  one-off conversion of the mirror with `convert_hf_to_gguf.py` from llama.cpp
+  at the pinned tag writes it, as `plan.md` describes.
 
   It costs disk twice over. The download itself is 5.0 GB of
   `model.safetensors` plus 17.5 MB of `tokenizer.json` and under a kilobyte of
@@ -88,10 +90,11 @@ ctest --test-dir build --output-on-failure
   release tag and builds `Tests/Oracle`, which compares our tokens and our
   logits against it. Off by default because both halves are expensive in a way
   the rest of this build is not — llama.cpp and ggml are minutes of compile,
-  and the `gemma-2b.gguf` the tests read is a 10 GB manual download that the
-  fetched mirror does not carry, so it takes `GEMMA_MODEL_DIR` pointing at
-  Google's own gated download and every test there skips without one. It means
-  nothing without
+  and the `gemma-2b.gguf` the tests read is a 10 GB F32 file the fetched
+  mirror does not carry — a one-off `convert_hf_to_gguf.py` run over it, from
+  llama.cpp at the same pinned tag, writes one — so it takes `GEMMA_MODEL_DIR`
+  pointing at a directory holding the GGUF beside the safetensors, and every
+  test there skips without one. It means nothing without
   `HF_EACP_ENABLE_TESTS`. The fetch names every ggml backend off, so the
   reference is exactly ggml's CPU arithmetic and a disagreement cannot be a
   backend's.

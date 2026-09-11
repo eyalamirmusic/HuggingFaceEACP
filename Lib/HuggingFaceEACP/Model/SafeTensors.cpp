@@ -227,12 +227,12 @@ eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
         raw.data(), raw.size(), eacp::GPU::BufferUsage::Storage);
 }
 
-// A buffer of halves is read one 32-bit word at a time — readHalf(i) fetches
-// word i / 2 and picks a side of it — so an odd count of halves needs a
-// padding half rather than a read one element past the allocation. An even
-// count, which is every weight matrix of an even width, still goes up
-// untouched.
-eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
+// A buffer of 16-bit floats is read one 32-bit word at a time — readHalf(i)
+// and readBFloat16(i) both fetch word i / 2 and pick a side of it — so an odd
+// count of them needs a padding element rather than a read one element past
+// the allocation. An even count, which is every weight matrix of an even
+// width, still goes up untouched.
+eacp::GPU::Buffer uploadPackedPairs(Span<const std::uint8_t> raw)
 {
     constexpr auto wordBytes = 4;
     const auto remainder = raw.size() % wordBytes;
@@ -471,17 +471,26 @@ TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
 
     // Already a layout a kernel binds, so these go straight from the blob
     // rather than through a widened copy of themselves: F32 as the floats a
-    // subscript reads, F16 as the packed halves readHalf reads.
+    // subscript reads, F16 and BF16 as the packed pairs readHalf and
+    // readBFloat16 read. A safetensors blob stores either as two little-endian
+    // 16-bit values per 32-bit word, which is the layout those calls index, so
+    // the bytes reach the device untouched.
     if (tensor.type == TensorType::F32)
         return {uploadBytes(rawBytes(tensor)), tensor.type};
 
-    if (tensor.type == TensorType::F16)
-        return {uploadPackedHalves(rawBytes(tensor)), tensor.type};
+    if (tensor.type == TensorType::F16 || tensor.type == TensorType::BF16)
+        return {uploadPackedPairs(rawBytes(tensor)), tensor.type};
 
-    // BF16 and F64 have no shader read of their own, so the conversion has to
-    // happen somewhere and doing it once here beats doing it in every kernel.
-    // For Gemma that is every weight in the model, at twice the bytes on the
-    // device — plan.md's first eacp gap, and the reason it is ranked first.
+    return makeWidenedBuffer(name);
+}
+
+// F64 through makeBuffer, and anything a float-only program is bound to. The
+// widening is exact for both 16-bit floats, so a tensor read here and the same
+// tensor read packed in a shader are the same numbers rather than the same
+// numbers to a tolerance.
+TensorBuffer SafeTensors::makeWidenedBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
     const auto values = readFloats(name);
     const auto byteCount = static_cast<std::int64_t>(values.size())
                            * static_cast<std::int64_t>(sizeof(float));

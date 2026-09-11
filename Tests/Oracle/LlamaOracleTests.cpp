@@ -11,7 +11,7 @@
 // would make every comparison built on it meaningless in a way that reads as
 // our bug — so the shape of what LlamaOracle hands back is asserted here, and
 // one end-to-end claim about the model's behaviour with it: greedy decoding
-// from "The capital of France is" reaches Paris.
+// from "The capital of France is" gives the continuation gemma-2b gives.
 //
 // Everything skips without gemma-2b.gguf, which comes with Google's own gated
 // download rather than with the mirror the build fetches — GEMMA_MODEL_DIR is
@@ -25,6 +25,13 @@ namespace
 {
 constexpr auto capitalPrompt = std::string_view {"The capital of France is"};
 constexpr auto greedySteps = 8;
+
+// The base model's own answer, which is a sentence rather than the capital:
+// "▁a" beats "▁Paris" by a third of a logit at the last prompt position.
+// transformers 5.17.0 in float32 gives these eight ids too, so the string is
+// gemma-2b's and not this reference's.
+constexpr auto capitalContinuation =
+    std::string_view {" a city of contrasts. It is a"};
 
 bool canRun()
 {
@@ -90,7 +97,7 @@ auto tOracleLogitsShape = test("Oracle/Llama/logitsShape") = []
 // path: greedy() decodes the prompt once and then one token at a time, so a
 // cache that was not carried between steps would produce a continuation that
 // reads as nonsense rather than as an error.
-auto tOracleGreedyReachesParis = test("Oracle/Llama/greedyReachesParis") = []
+auto tOracleGreedyContinues = test("Oracle/Llama/greedyContinuesThePrompt") = []
 {
     if (!canRun())
         return;
@@ -110,6 +117,5 @@ auto tOracleGreedyReachesParis = test("Oracle/Llama/greedyReachesParis") = []
 
     std::cout << "  \"" << capitalPrompt << "\" -> \"" << text << "\"\n";
 
-    check(text.find("Paris") != std::string::npos,
-          "Paris arrives within eight tokens");
+    check(text == capitalContinuation, "the continuation is the model's own");
 };

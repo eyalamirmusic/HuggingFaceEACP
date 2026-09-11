@@ -55,31 +55,15 @@ void TensorLoader::checkShape(const TensorInfo& tensor, TensorShape expected) co
         Span<const int> {expected.begin(), static_cast<int>(expected.size())});
 }
 
-void TensorLoader::rejectPackedHalf(const TensorBuffer& loaded,
-                                    const std::string& name,
-                                    std::string_view reader) const
-{
-    if (loaded.isPackedHalf())
-        throw ModelError {"tensor '" + name + "' is fp16, and this "
-                          + std::string {component} + " binds it to "
-                          + std::string {reader}
-                          + ", which has no packed-half read: ship the tensor "
-                            "as F32"};
-}
-
 TensorBuffer TensorLoader::loadFloatTensor(const std::string& name,
-                                           TensorShape expected,
-                                           std::string_view reader) const
+                                           TensorShape expected) const
 {
     checkShape(require(name), expected);
-    auto loaded = file.makeBuffer(name);
-    rejectPackedHalf(loaded, name, reader);
-
-    return loaded;
+    return file.makeWidenedBuffer(name);
 }
 
-TensorBuffer TensorLoader::loadProjectionWeight(const std::string& name,
-                                                TensorShape expected) const
+TensorBuffer TensorLoader::loadWeight(const std::string& name,
+                                      TensorShape expected) const
 {
     checkShape(require(name), expected);
     return file.makeBuffer(name);

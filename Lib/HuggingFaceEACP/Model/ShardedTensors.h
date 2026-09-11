@@ -48,6 +48,7 @@ public:
     Vector<float> readFloats(std::string_view name) const;
     void readFloats(std::string_view name, Span<float> destination) const;
     TensorBuffer makeBuffer(std::string_view name) const;
+    TensorBuffer makeWidenedBuffer(std::string_view name) const;
 
     // The shard the tensor lives in, mapped if it was not already.
     const SafeTensors& shardHolding(std::string_view name) const;

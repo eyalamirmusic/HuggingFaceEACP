@@ -376,6 +376,8 @@ struct SimdTiledMatMulProgram final : ComputeProgram
     {
         if constexpr (bStorage == WeightStorage::PackedHalf)
             return b.readHalf(index);
+        else if constexpr (bStorage == WeightStorage::PackedBFloat16)
+            return b.readBFloat16(index);
         else
             return b[index];
     }
@@ -446,6 +448,9 @@ using SimdTiledLinear =
     SimdTiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Float>;
 using HalfWeightSimdTiledLinear =
     SimdTiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
+using BFloat16WeightSimdTiledLinear =
+    SimdTiledMatMulProgram<OperandLayout::ContiguousK,
+                           WeightStorage::PackedBFloat16>;
 using SimdTiledMatMul =
     SimdTiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxSimdTiledMatMul = SimdTiledMatMulProgram<OperandLayout::ContiguousN,
@@ -468,11 +473,13 @@ using MaximaSimdTiledLinear = SimdTiledMatMulProgram<OperandLayout::ContiguousK,
 #if defined(__APPLE__)
 using LinearProduct = SimdTiledLinear;
 using HalfWeightLinearProduct = HalfWeightSimdTiledLinear;
+using BFloat16WeightLinearProduct = BFloat16WeightSimdTiledLinear;
 using AttentionScoresProduct = MaximaSimdTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxSimdTiledMatMul;
 #else
 using LinearProduct = TiledLinear;
 using HalfWeightLinearProduct = HalfWeightTiledLinear;
+using BFloat16WeightLinearProduct = BFloat16WeightTiledLinear;
 using AttentionScoresProduct = MaximaTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxTiledMatMul;
 #endif

@@ -93,6 +93,26 @@ auto tSimdTiledLinearPackedWeights =
     TiledProduct::checkPackedLinear<HalfWeightSimdTiledLinear>(100, 45, 76, 410u);
 };
 
+// Gemma's own storage through the product a prompt spends its time in, and
+// against the float product bit for bit — see checkPackedBFloat16Linear. The
+// second shape is 2048 deep, which is the model's width and a long enough sum
+// that a widening that was not exact would show.
+auto tSimdTiledLinearBFloat16Weights =
+    test("Kernels/simdTiledLinearBFloat16Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
+                                            SimdTiledLinear>(37, 21, 35, 400u);
+
+    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
+                                            SimdTiledLinear>(100, 45, 76, 410u);
+
+    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
+                                            SimdTiledLinear>(64, 2048, 256, 420u);
+};
+
 // The batch fold and the causal mask together: one batch per head over the
 // head's slice of rows the batch strides address, and a trapezoid whose masked
 // count is asserted rather than only its values.

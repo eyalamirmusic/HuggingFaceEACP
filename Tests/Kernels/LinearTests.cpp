@@ -128,6 +128,56 @@ Vector<float> widenedHalves(int count)
     return values;
 }
 
+// bfloat16 with a normal exponent, both signs, and a mantissa walking its whole
+// seven-bit field — the same sweep as halfPattern over the other 16-bit float.
+// 0x3F00 is the exponent of a value in [0.5, 1), which is where a normalised
+// weight lives.
+std::uint16_t bfloat16Pattern(int index)
+{
+    const auto sign = index % 2 == 0 ? 0x0000u : 0x8000u;
+    const auto mantissa = (unsigned) ((index * 37) % 128);
+
+    return (std::uint16_t) (sign | 0x3F00u | mantissa);
+}
+
+// bfloat16 is the top sixteen bits of a float32 and nothing else, so this is
+// the widening written from its definition rather than out of the call the
+// kernel makes.
+float widenedBFloat16(std::uint16_t bits)
+{
+    const auto word = (std::uint32_t) bits << 16;
+    auto value = 0.f;
+
+    std::memcpy(&value, &word, sizeof(value));
+
+    return value;
+}
+
+Buffer packedBFloat16Buffer(int count)
+{
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize(((count + 1) / 2) * 4);
+
+    for (auto index = 0; index < count; ++index)
+    {
+        const auto bits = bfloat16Pattern(index);
+        std::memcpy(bytes.data() + index * 2, &bits, sizeof(bits));
+    }
+
+    return Device::shared().makeBuffer(
+        bytes.data(), bytes.size(), BufferUsage::Storage);
+}
+
+Vector<float> widenedBFloat16s(int count)
+{
+    auto values = sized(count);
+
+    for (auto index = 0; index < count; ++index)
+        values[index] = widenedBFloat16(bfloat16Pattern(index));
+
+    return values;
+}
+
 // None of the three equal, none a multiple of the 8 x 8 dispatch group, so a
 // kernel that confused the weight's output stride for its input stride, or
 // leaned on the grid landing exactly on the matrix, fails here rather than on
@@ -295,6 +345,49 @@ auto tHalfWeightLinearMatchesCpu = test("Kernels/halfWeightLinearMatchesCpu") = 
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
+};
+
+// The storage Gemma ships, over the same shapes, and against the float program
+// as well as against the reference: widening a bf16 is a shift and a bitcast,
+// so the two programs sum identical numbers in identical order and have to
+// agree bit for bit rather than to a tolerance. An odd element count again, so
+// the last output's thread reads the value in the word the padding completes.
+auto tBFloat16WeightLinearMatchesCpu =
+    test("Kernels/bfloat16WeightLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 7;
+    constexpr auto outputs = 3;
+    constexpr auto rows = 5;
+
+    auto input = spreadValues(rows * inner, 424242u, 2.f);
+    auto bias = spreadValues(outputs, 242424u, 1.f);
+    auto weight = widenedBFloat16s(outputs * inner);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = packedBFloat16Buffer(outputs * inner);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = BFloat16WeightLinear {};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+
+    auto result = runOverGrid(kernel, output, outputs, rows);
+    auto expected = linearReference(input, weight, bias, rows, inner, outputs);
+    auto widenedResult = runLinear(input, weight, bias, rows, inner, outputs);
+
+    for (auto i = 0; i < result.size(); ++i)
+    {
+        check(isClose(result[i], expected[i], 1e-5));
+        check(result[i] == widenedResult[i]);
+    }
 };
 
 namespace
@@ -479,4 +572,69 @@ auto tHalfWeightSplitLinearMatchesCpu =
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
+};
+
+namespace
+{
+// The bf16 split form against both of its answers: the scalar reference over
+// the widened weights, and the float program over those same widened weights
+// bit for bit.
+void checkBFloat16SplitLinear(int inner, int outputs, int rows)
+{
+    auto input = spreadValues(rows * inner, 424242u, 2.f);
+    auto bias = spreadValues(outputs, 242424u, 1.f);
+    auto weight = widenedBFloat16s(outputs * inner);
+
+    auto inputBuffer = storageOf(input);
+    auto packedWeights = packedBFloat16Buffer(outputs * inner);
+    auto widenedWeights = storageOf(weight);
+    auto biasBuffer = storageOf(bias);
+    auto packedOutput = outputFor(rows * outputs);
+    auto widenedOutput = outputFor(rows * outputs);
+
+    auto bind = [&](auto& kernel, const Buffer& weights, const Buffer& target)
+    {
+        kernel.input = inputBuffer;
+        kernel.weights = weights;
+        kernel.bias = biasBuffer;
+        kernel.output = target;
+        kernel.innerCount = (unsigned) inner;
+        kernel.outputWidth = (unsigned) outputs;
+        kernel.rowCount = (unsigned) rows;
+        kernel.gelu = 0u;
+        kernel.residual = 0u;
+    };
+
+    auto packedKernel = BFloat16WeightSplitLinear {32};
+    bind(packedKernel, packedWeights, packedOutput);
+
+    auto widenedKernel = SplitLinear {32};
+    bind(widenedKernel, widenedWeights, widenedOutput);
+
+    auto result = runSplitLinear(packedKernel, packedOutput, outputs, rows);
+    auto widened = runSplitLinear(widenedKernel, widenedOutput, outputs, rows);
+    auto expected = linearReference(input, weight, bias, rows, inner, outputs);
+
+    for (auto i = 0; i < result.size(); ++i)
+    {
+        check(isClose(result[i], expected[i], 1e-5));
+        check(result[i] == widened[i]);
+    }
+}
+} // namespace
+
+// The form a decode step's projections and its logits product actually take,
+// in Gemma's own storage. Both weight reads are covered: an inner count that
+// divides by four takes the two-word readBFloat16x2 path, and one that does
+// not takes the element read — and the second leaves an odd element count, so
+// the last output's thread reads the value in the word the padding completes.
+auto tBFloat16WeightSplitLinearMatchesCpu =
+    test("Kernels/bfloat16WeightSplitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    checkBFloat16SplitLinear(8, 5, 2);
+    checkBFloat16SplitLinear(7, 5, 2);
+    checkBFloat16SplitLinear(64, 3, 1);
 };

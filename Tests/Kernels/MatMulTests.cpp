@@ -201,3 +201,47 @@ auto tMatMulOneProgramTwoShapes = test("Kernels/matMulOneProgramTwoShapes") = []
     for (auto i = 0; i < secondResult.size(); ++i)
         check(isClose(secondResult[i], secondExpected[i], 1e-5));
 };
+
+// The same product over a weight left in the storage Gemma ships, checked
+// twice: against the reference over the widened weights, and against the float
+// program over those same weights bit for bit. Widening a bf16 is the sixteen
+// bits back at the top of a word, so both programs multiply and add identical
+// float32 numbers in identical order and "the same answer" is exact.
+auto tBFloat16WeightMatMulMatchesCpu =
+    test("Kernels/bfloat16WeightMatMulMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    auto a = spreadValues(rowCount * innerCount, 314159u, 2.f);
+    auto b = spreadValues(innerCount * columnCount, 271828u, 3.f);
+    auto bias = spreadValues(columnCount, 161803u, 1.f);
+
+    auto widened = Vector<float> {};
+    auto packed = packedBFloat16Storage(b, widened);
+
+    auto aBuffer = storageOf(a);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rowCount * columnCount);
+
+    auto kernel = BFloat16WeightMatMul {};
+    kernel.a = aBuffer;
+    kernel.b = packed;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) innerCount;
+    kernel.columnCount = (unsigned) columnCount;
+
+    auto result = runOverGrid(kernel, output, columnCount, rowCount);
+    auto expected =
+        matMulReference(a, widened, bias, rowCount, innerCount, columnCount);
+
+    auto widenedResult =
+        runMatMul(a, widened, bias, rowCount, innerCount, columnCount);
+
+    for (auto i = 0; i < result.size(); ++i)
+    {
+        check(isClose(result[i], expected[i], 1e-5));
+        check(result[i] == widenedResult[i]);
+    }
+};

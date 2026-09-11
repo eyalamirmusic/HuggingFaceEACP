@@ -53,13 +53,15 @@ namespace HF
 // top-p onto the device is a later round; the tokens are the same either way,
 // which is what the tests over the two paths say.
 //
-// **Memory.** Gemma's weights are BF16 and arrive widened to F32 — plan.md's
-// first gap — so the device holds about 10 GB of them, with the 2.1 GB
-// embedding bound twice: once as the gather's table and once as the tied logits
-// projection. On top of that the logits buffer is promptCapacity() rows of the
-// vocabulary, 524 MB at the default 512 rows, and it is the one buffer here
-// that scales with that setting. The 128 GB machine this is developed on takes
-// it; plan.md's first two gaps are what change it.
+// **Memory.** Gemma's weights are BF16 and stay BF16 on the device — plan.md's
+// first gap, now that eacp reads them packed — so the device holds about 5 GB
+// of them rather than the 10 GB a widened copy was, and the embedding is
+// 1.05 GB bound twice: once as the gather's table and once as the tied logits
+// projection, one buffer either way. On top of that the logits buffer is
+// promptCapacity() rows of the vocabulary, 524 MB at the default 512 rows, and
+// it is the one buffer here that scales with that setting. The 128 GB machine
+// this is developed on takes it comfortably; a 16 GB one is what plan.md's
+// third gap, the zero-copy upload, is about.
 class Gemma
 {
 public:
@@ -217,6 +219,13 @@ public:
     // that an ordinary prompt is one block and takes the many-row tiled
     // product, small enough that the logits buffer behind it is half a gigabyte
     // rather than eight.
+    //
+    // Measured on gemma-2b on an M5 Max over a 289-token prompt, best of five
+    // runs: 64 rows a block prefills in 0.367 s, 128 in 0.312, 256 in 0.307,
+    // and 512 and 1024 — one block either way at that length — in 0.286 and
+    // 0.271, which is the same number twice. Capacity past a prompt's own
+    // length buys nothing and costs the megabyte a row takes in the logits
+    // buffer.
     static constexpr int defaultPromptCapacity = 512;
 
 private:

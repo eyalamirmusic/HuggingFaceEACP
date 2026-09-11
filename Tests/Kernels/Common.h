@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 
 namespace HF
@@ -41,6 +42,52 @@ inline eacp::GPU::Buffer storageOf(const Vector<float>& values)
                                                   (int) sizeof(float)
                                                       * values.size(),
                                                   eacp::GPU::BufferUsage::Storage);
+}
+
+// bfloat16s as a checkpoint ships them: two to a word, the low one first, with
+// the same values widened back into `widened` so a reference asserts against
+// exactly the numbers the kernel reads rather than against what was rounded.
+//
+// The rounding is eacp's own rather than any hardware's — no shader dialect has
+// a bf16 instruction, so packBFloat16x2 rounds to nearest even in integer
+// arithmetic and bfloat16FromFloat is the host side of that same arithmetic.
+inline eacp::GPU::Buffer packedBFloat16Storage(const Vector<float>& values,
+                                               Vector<float>& widened)
+{
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize(((values.size() + 1) / 2) * 4);
+    widened = sized(values.size());
+
+    for (auto index = 0; index < values.size(); ++index)
+    {
+        const auto bits = eacp::GPU::bfloat16FromFloat(values[index]);
+        widened[index] = eacp::GPU::bfloat16ToFloat(bits);
+
+        std::memcpy(bytes.data() + index * 2, &bits, sizeof(bits));
+    }
+
+    return eacp::GPU::Device::shared().makeBuffer(
+        bytes.data(), bytes.size(), eacp::GPU::BufferUsage::Storage);
+}
+
+// The fp16 pair of the above, for the kernels that read either.
+inline eacp::GPU::Buffer packedHalfStorage(const Vector<float>& values,
+                                           Vector<float>& widened)
+{
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize(((values.size() + 1) / 2) * 4);
+    widened = sized(values.size());
+
+    for (auto index = 0; index < values.size(); ++index)
+    {
+        const auto bits = eacp::GPU::halfFromFloat(values[index]);
+        widened[index] = eacp::GPU::halfToFloat(bits);
+
+        std::memcpy(bytes.data() + index * 2, &bits, sizeof(bits));
+    }
+
+    return eacp::GPU::Device::shared().makeBuffer(
+        bytes.data(), bytes.size(), eacp::GPU::BufferUsage::Storage);
 }
 
 inline eacp::GPU::Buffer outputFor(int elementCount)

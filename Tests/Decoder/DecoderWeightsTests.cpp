@@ -120,6 +120,82 @@ auto tFusedGateUpIsGateThenUp = test("Decoder/fusedGateUpIsGateThenUp") = []
     }
 };
 
+// A checkpoint in Gemma's own storage: every weight reaches the device packed,
+// the norm scales are widened because RMSNorm subscripts floats, and the
+// buffers are half the bytes their widened selves would be.
+auto tBFloat16WeightsStayPacked = test("Decoder/bfloat16WeightsStayPacked") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-bfloat16-weights", TensorType::BF16};
+
+    const auto shape = checkpoint.shape();
+    const auto weights = DecoderWeights {checkpoint.weights(), shape};
+
+    check(weights.tokenEmbedding.isPackedBFloat16());
+    check(weights.tokenEmbedding.buffer.size()
+          == shape.vocabularySize * shape.width * 2);
+
+    check(!weights.finalNorm.isPackedBFloat16());
+    check(bufferElements(weights.finalNorm) == shape.width);
+
+    for (const auto& layer: weights.layers)
+    {
+        check(layer.query.isPackedBFloat16());
+        check(layer.key.isPackedBFloat16());
+        check(layer.value.isPackedBFloat16());
+        check(layer.output.isPackedBFloat16());
+        check(layer.down.isPackedBFloat16());
+        check(layer.fusedGateUp.isPackedBFloat16());
+
+        check(!layer.inputNorm.isPackedBFloat16());
+        check(!layer.postAttentionNorm.isPackedBFloat16());
+
+        check(layer.down.buffer.size() == shape.width * shape.intermediate * 2);
+    }
+};
+
+// The stacking done on the packed bytes rather than through a widening — the
+// whole point of gap 1 for this tensor, since gate and up are the largest
+// weights in a layer. Read back as the words they are and widened here, so a
+// stack that shifted the up rows by a half-word, or joined them in the wrong
+// order, fails.
+auto tPackedFusedGateUpIsGateThenUp =
+    test("Decoder/packedFusedGateUpIsGateThenUp") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-fused-bfloat16", TensorType::BF16};
+
+    const auto shape = checkpoint.shape();
+    const auto weights = DecoderWeights {checkpoint.weights(), shape};
+
+    const auto halfCount = shape.intermediate * shape.width;
+    const auto& fused = weights.layers[0].fusedGateUp;
+
+    check(fused.isPackedBFloat16());
+    check(fused.buffer.size() == 2 * halfCount * 2);
+
+    auto packed = Vector<std::uint16_t> {};
+    packed.resize(2 * halfCount);
+    fused.buffer.read(packed.data(), fused.buffer.size());
+
+    const auto gate = checkpoint.weights().readFloats(
+        GemmaTensors::layerTensorName(0, GemmaTensors::gateProjection));
+    const auto up = checkpoint.weights().readFloats(
+        GemmaTensors::layerTensorName(0, GemmaTensors::upProjection));
+
+    for (auto index = 0; index < halfCount; ++index)
+    {
+        check(bfloat16ToFloat(packed[index]) == gate[index]);
+        check(bfloat16ToFloat(packed[halfCount + index]) == up[index]);
+    }
+};
+
 // The same checkpoint split across two shards with an index naming them, which
 // is the shape gemma-2b itself ships in: the loader has to resolve every name
 // through the index, and neither shard holds a whole model.

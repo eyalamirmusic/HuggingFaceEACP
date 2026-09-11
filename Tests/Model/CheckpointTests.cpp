@@ -120,9 +120,9 @@ auto tCheckpointMatchesTheCatalogue =
     check(weights.mappedShardCount() == weights.shardCount());
 };
 
-// Gemma ships BF16, which has no shader read yet — plan.md's first eacp gap.
-// The loader widens it on the CPU, and this is where a real checkpoint says
-// what it actually holds.
+// Gemma ships BF16, and it now reaches the device in it — this is where a real
+// checkpoint says what it actually holds, since every packed path below rests
+// on that.
 auto tCheckpointStorageIsBFloat = test("Model/Checkpoint/storageIsBFloat") = []
 {
     if (!hasRealCheckpoint())
@@ -134,16 +134,20 @@ auto tCheckpointStorageIsBFloat = test("Model/Checkpoint/storageIsBFloat") = []
 
     const auto& embedding = weights.info(GemmaTensors::embedding);
 
+    check(embedding.type == TensorType::BF16);
     check(isFloatingPoint(embedding.type));
     check(embedding.elementCount()
           == static_cast<std::int64_t>(config.vocabularySize) * config.hiddenSize);
 
-    // A widened embedding is 2.10 GB against the 2.15 GB an int describes,
-    // which is plan.md's second gap and the reason this is worth asserting.
+    // Packed, the embedding is 1.05 GB; widened it was 2.10 GB against the
+    // 2.15 GB an int describes, which is plan.md's second gap and why the
+    // margin is worth asserting rather than assuming.
+    const auto limit = static_cast<std::int64_t>(2) * 1024 * 1024 * 1024;
     const auto widenedBytes =
         embedding.elementCount() * static_cast<std::int64_t>(sizeof(float));
 
-    check(widenedBytes < static_cast<std::int64_t>(2) * 1024 * 1024 * 1024);
+    check(static_cast<std::int64_t>(embedding.byteCount) == widenedBytes / 2);
+    check(widenedBytes < limit);
 };
 
 // One tensor read all the way through, so the mapping, the offsets and the

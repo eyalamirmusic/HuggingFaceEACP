@@ -5,17 +5,13 @@
 
 #include <eacp/GPU/GPU.h>
 
+#include <cstring>
 #include <string>
 
 namespace HF
 {
 namespace
 {
-// The gather has no class in Kernels/ that names it in a signature, so the
-// tensors it reads name it by what it does rather than by a type this file
-// would have to keep in step.
-constexpr auto embeddingReader = "the embedding gather";
-
 // The word every refusal uses for a top-level tensor, and the one a layer's
 // tensors use, so a message says which part of the model would not take the
 // checkpoint rather than leaving that to a stack trace.
@@ -42,9 +38,34 @@ const DecoderShape& validated(const DecoderShape& shape)
 TensorBuffer loadTokenEmbedding(const ShardedTensors& file,
                                 const DecoderShape& shape)
 {
-    return decoderTensors(file).loadFloatTensor(GemmaTensors::embedding,
-                                                {shape.vocabularySize, shape.width},
-                                                embeddingReader);
+    return decoderTensors(file).loadWeight(GemmaTensors::embedding,
+                                           {shape.vocabularySize, shape.width});
+}
+
+// Whether a kernel reads this storage as pairs in a word rather than as floats
+// it subscripts, which is what decides whether the two halves below can be
+// joined as the bytes they already are.
+bool isPackedPair(TensorType type)
+{
+    return type == TensorType::F16 || type == TensorType::BF16;
+}
+
+template <typename Element>
+eacp::GPU::Buffer uploadStacked(Span<const Element> first,
+                                Span<const Element> second)
+{
+    auto stacked = Vector<Element> {};
+    stacked.resize(first.size() + second.size());
+
+    std::memcpy(stacked.data(), first.data(), sizeof(Element) * first.size());
+    std::memcpy(stacked.data() + first.size(),
+                second.data(),
+                sizeof(Element) * second.size());
+
+    return eacp::GPU::Device::shared().makeBuffer(stacked.data(),
+                                                  (int) sizeof(Element)
+                                                      * stacked.size(),
+                                                  eacp::GPU::BufferUsage::Storage);
 }
 
 // gate_proj and up_proj stacked into the one [2 * intermediate, width] weight
@@ -54,6 +75,13 @@ TensorBuffer loadTokenEmbedding(const ShardedTensors& file,
 // Both are checked at their shipped shapes before a byte is read, so a
 // checkpoint whose gate and up disagree is a ModelError naming the tensor
 // rather than a stack of two matrices of different widths.
+//
+// The stack is of the raw bytes when the two arrive in the same packed
+// storage, so the layer's largest weight is joined without being widened to be
+// joined — the whole point of reading bf16 packed, since this is the tensor a
+// widening would cost the most. Two 16-bit values share a word, so the up
+// rows can only start where the gate rows end if the gate half is a whole
+// number of words; an odd half, which no real shape has, widens instead.
 TensorBuffer
     loadFusedGateUp(const ShardedTensors& file, const DecoderShape& shape, int index)
 {
@@ -63,10 +91,17 @@ TensorBuffer
     const auto upName =
         GemmaTensors::layerTensorName(index, GemmaTensors::upProjection);
 
-    tensors.checkShape(tensors.require(gateName), {shape.intermediate, shape.width});
-    tensors.checkShape(tensors.require(upName), {shape.intermediate, shape.width});
+    const auto& gate = tensors.require(gateName);
+    const auto& up = tensors.require(upName);
+
+    tensors.checkShape(gate, {shape.intermediate, shape.width});
+    tensors.checkShape(up, {shape.intermediate, shape.width});
 
     const auto halfCount = shape.intermediate * shape.width;
+
+    if (gate.type == up.type && isPackedPair(gate.type) && halfCount % 2 == 0)
+        return {uploadStacked(file.rawBytes(gateName), file.rawBytes(upName)),
+                gate.type};
 
     auto stacked = Vector<float> {};
     stacked.resize(2 * halfCount);
@@ -88,28 +123,26 @@ DecoderLayerWeights::DecoderLayerWeights(const ShardedTensors& file,
                                          int index)
     : inputNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::inputNorm),
-          {shape.width},
-          "RMSNorm"))
-    , query(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
+          {shape.width}))
+    , query(TensorLoader {file, layerComponent(index)}.loadWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::queryProjection),
           {shape.queryWidth(), shape.width}))
-    , key(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
+    , key(TensorLoader {file, layerComponent(index)}.loadWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::keyProjection),
           {shape.kvWidth(), shape.width}))
-    , value(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
+    , value(TensorLoader {file, layerComponent(index)}.loadWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::valueProjection),
           {shape.kvWidth(), shape.width}))
-    , output(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
+    , output(TensorLoader {file, layerComponent(index)}.loadWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::outputProjection),
           {shape.width, shape.queryWidth()}))
     , fusedGateUp(loadFusedGateUp(file, shape, index))
-    , down(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
+    , down(TensorLoader {file, layerComponent(index)}.loadWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::downProjection),
           {shape.width, shape.intermediate}))
     , postAttentionNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::postAttentionNorm),
-          {shape.width},
-          "RMSNorm"))
+          {shape.width}))
 {
 }
 
@@ -117,8 +150,8 @@ DecoderWeights::DecoderWeights(const ShardedTensors& file,
                                const DecoderShape& shapeToUse)
     : shape(validated(shapeToUse))
     , tokenEmbedding(loadTokenEmbedding(file, shapeToUse))
-    , finalNorm(decoderTensors(file).loadFloatTensor(
-          GemmaTensors::finalNorm, {shapeToUse.width}, "RMSNorm"))
+    , finalNorm(decoderTensors(file).loadFloatTensor(GemmaTensors::finalNorm,
+                                                     {shapeToUse.width}))
 {
     layers.reserve(shapeToUse.layers);
 

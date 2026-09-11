@@ -126,13 +126,18 @@ void Decoder::prepare(Device& device)
     decoderShape.validate();
 
     embedding.prepare(device);
+    packedEmbedding.prepare(device);
+    bfloatEmbedding.prepare(device);
     normalisation.prepare(device);
     product.prepare(device);
     packedProduct.prepare(device);
+    bfloatProduct.prepare(device);
     splitProjection.prepare(device);
     packedSplitProjection.prepare(device);
+    bfloatSplitProjection.prepare(device);
     splitLogits.prepare(device);
     packedSplitLogits.prepare(device);
+    bfloatSplitLogits.prepare(device);
     rotation.prepare(device);
     gating.prepare(device);
     prefillAttention.prepare(device);
@@ -207,11 +212,11 @@ void Decoder::encodeNorm(ComputePass& pass,
     normalisation.dispatchRows(pass, rowCount);
 }
 
-// The one place a weight's storage decides anything: a tensor the loader left
-// packed goes to the program that reads packed halves, and one it uploaded as
-// floats to the program that subscripts floats. Neither can read the other's
-// buffer, which is why the choice is made from the buffer rather than from a
-// build-time switch.
+// One of the two places a weight's storage decides anything: a tensor the
+// checkpoint shipped packed goes to the program compiled to read that packing,
+// and one that arrived as floats to the program that subscripts floats. None of
+// the three can read another's buffer, which is why the choice is made from the
+// buffer rather than from a build-time switch.
 //
 // The row count decides the other axis. The split form gives every lane of a
 // group a share of one output's inner sum, which is what a one-row decode step
@@ -231,8 +236,9 @@ void Decoder::encodeProduct(ComputePass& pass,
     const auto fewRows = rowCount <= splitRowLimit;
     const auto logits = role == ProductRole::Logits;
 
-    if (weight.isPackedHalf() && fewRows)
-        dispatchProduct(logits ? packedSplitLogits : packedSplitProjection,
+    auto dispatch = [&](auto& program)
+    {
+        dispatchProduct(program,
                         pass,
                         input,
                         weight.buffer,
@@ -242,39 +248,56 @@ void Decoder::encodeProduct(ComputePass& pass,
                         outputWidth,
                         rowCount,
                         residual);
+    };
+
+    if (weight.isPackedBFloat16())
+    {
+        if (fewRows)
+            dispatch(logits ? bfloatSplitLogits : bfloatSplitProjection);
+        else
+            dispatch(bfloatProduct);
+    }
     else if (weight.isPackedHalf())
-        dispatchProduct(packedProduct,
-                        pass,
-                        input,
-                        weight.buffer,
-                        bias,
-                        target,
-                        innerCount,
-                        outputWidth,
-                        rowCount,
-                        residual);
-    else if (fewRows)
-        dispatchProduct(logits ? splitLogits : splitProjection,
-                        pass,
-                        input,
-                        weight.buffer,
-                        bias,
-                        target,
-                        innerCount,
-                        outputWidth,
-                        rowCount,
-                        residual);
+    {
+        if (fewRows)
+            dispatch(logits ? packedSplitLogits : packedSplitProjection);
+        else
+            dispatch(packedProduct);
+    }
     else
-        dispatchProduct(product,
-                        pass,
-                        input,
-                        weight.buffer,
-                        bias,
-                        target,
-                        innerCount,
-                        outputWidth,
-                        rowCount,
-                        residual);
+    {
+        if (fewRows)
+            dispatch(logits ? splitLogits : splitProjection);
+        else
+            dispatch(product);
+    }
+}
+
+// The other place: the gather reads the tied embedding where it lies, so the
+// one buffer serves it and the logits product above without a second copy of
+// the largest tensor in the model.
+void Decoder::encodeEmbed(ComputePass& pass,
+                          const BufferRange& tokens,
+                          const TensorBuffer& table,
+                          int tokenCount)
+{
+    auto dispatch = [&](auto& program)
+    {
+        program.tokens = tokens;
+        program.tokenTable = table.buffer;
+        program.output = *hidden;
+        program.width = (std::uint32_t) decoderShape.width;
+        program.scale = decoderShape.embeddingScale;
+
+        pass.dispatch(program, decoderShape.width, tokenCount);
+    };
+
+    if (table.isPackedBFloat16())
+        dispatch(bfloatEmbedding);
+    else if (table.isPackedHalf())
+        dispatch(packedEmbedding);
+    else
+        dispatch(embedding);
 }
 
 // Appending to the cache is a bind, not a copy: the key and value projections
@@ -503,13 +526,7 @@ void Decoder::step(ComputePass& pass,
                           + std::to_string(decoderShape.maxPositions)
                           + " this decoder was built for"};
 
-    embedding.tokens = tokens;
-    embedding.tokenTable = weights.tokenEmbedding.buffer;
-    embedding.output = *hidden;
-    embedding.width = (std::uint32_t) decoderShape.width;
-    embedding.scale = decoderShape.embeddingScale;
-
-    pass.dispatch(embedding, decoderShape.width, tokenCount);
+    encodeEmbed(pass, tokens, weights.tokenEmbedding, tokenCount);
 
     for (auto index = 0; index < decoderShape.layers; ++index)
     {

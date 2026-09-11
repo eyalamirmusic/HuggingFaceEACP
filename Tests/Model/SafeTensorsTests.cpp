@@ -1,5 +1,7 @@
 #include "Common.h"
 
+#include <eacp/GPU/GPU.h>
+
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -80,8 +82,10 @@ auto tFloatRoundTrips = test("Model/SafeTensors/floatRoundTrips") = []
               == std::bit_cast<std::uint32_t>(expected));
 };
 
-// The widening plan.md's first eacp gap would move into a shader. Compared by
-// bits, not by value, so a NaN pattern is checked as exactly as a finite one.
+// The CPU widening, which is what the references a kernel is checked against
+// read a checkpoint through — the device gets the packed bytes instead, see
+// bfloat16UploadsPacked below. Compared by bits, not by value, so a NaN
+// pattern is checked as exactly as a finite one.
 auto tBfloatWidensExactly = test("Model/SafeTensors/bfloatWidensExactly") = []
 {
     const auto bits = toBytes<std::uint16_t>(bfloatSweep);
@@ -101,6 +105,74 @@ auto tBfloatWidensExactly = test("Model/SafeTensors/bfloatWidensExactly") = []
     for (auto pattern: bfloatSweep)
         check(std::bit_cast<std::uint32_t>(values[index++])
               == std::bit_cast<std::uint32_t>(bfloatReference(pattern)));
+};
+
+// The upload side of the same tensor, and the whole of what reading bf16
+// packed asks of the loader: the blob's bytes reach the device unchanged, and
+// the buffer says which packing they are, since nothing about a GPU buffer
+// does. A word holds two bfloat16s little-endian in the file and the same two
+// in the buffer, which is the layout InputBuffer::readBFloat16 indexes — so
+// what is asserted here is that no byte moved.
+auto tBFloat16UploadsPacked = test("Model/SafeTensors/bfloat16UploadsPacked") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto bits = toBytes<std::uint16_t>(bfloatSweep);
+    const auto count = static_cast<int>(bfloatSweep.size());
+
+    const auto header = R"({"w":{"dtype":"BF16","shape":[)" + std::to_string(count)
+                        + R"(],"data_offsets":[0,)" + std::to_string(count * 2)
+                        + R"(]}})";
+
+    const auto file = SafeTensors::fromBytes(assemble(header, bits));
+    const auto loaded = file.makeBuffer("w");
+
+    check(loaded.storage == TensorType::BF16);
+    check(loaded.isPackedBFloat16());
+    check(!loaded.isPackedHalf());
+    check(loaded.buffer.size() == ((count + 1) / 2) * 4);
+
+    auto uploaded = Vector<std::uint8_t> {};
+    uploaded.resize(loaded.buffer.size());
+    loaded.buffer.read(uploaded.data(), uploaded.size());
+
+    for (auto index = 0; index < bits.size(); ++index)
+        check(uploaded[index] == bits[index]);
+
+    // The widened buffer is still there for the one reader that has no packed
+    // read — the norm scales — and it is F32 at twice the bytes.
+    const auto widened = file.makeWidenedBuffer("w");
+
+    check(widened.storage == TensorType::F32);
+    check(!widened.isPackedBFloat16());
+    check(widened.buffer.size() == count * (int) sizeof(float));
+};
+
+// An odd count of bfloat16s, which is a half-empty last word: readBFloat16
+// fetches word i / 2 whichever half it wants, so the buffer is padded to a
+// whole word rather than read one element past its end.
+auto tOddBFloat16CountIsPadded =
+    test("Model/SafeTensors/oddBFloat16CountIsPadded") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto bits = toBytes<std::uint16_t>({0x3F80, 0xC000, 0x4049});
+    const auto file = SafeTensors::fromBytes(assemble(
+        R"({"w":{"dtype":"BF16","shape":[3],"data_offsets":[0,6]}})", bits));
+
+    const auto loaded = file.makeBuffer("w");
+
+    check(loaded.isPackedBFloat16());
+    check(loaded.buffer.size() == 8);
+
+    auto uploaded = Vector<std::uint8_t> {};
+    uploaded.resize(loaded.buffer.size());
+    loaded.buffer.read(uploaded.data(), uploaded.size());
+
+    for (auto index = 0; index < bits.size(); ++index)
+        check(uploaded[index] == bits[index]);
 };
 
 // The same sweep read through the value the standard defines, so a widening

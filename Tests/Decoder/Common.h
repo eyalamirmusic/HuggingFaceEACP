@@ -70,16 +70,27 @@ struct SyntheticTensor
     Vector<float> values;
 };
 
-// A safetensors file assembled in memory out of F32 tensors — eight bytes of
-// header length, the JSON naming each tensor's dtype, shape and byte range,
-// then the blob those ranges are relative to.
+// A safetensors file assembled in memory — eight bytes of header length, the
+// JSON naming each tensor's dtype, shape and byte range, then the blob those
+// ranges are relative to.
+//
+// In whichever of the three floating dtypes a repo ships: F32, the F16 a
+// converted repo may carry, or the BF16 gemma-2b itself is in. A 16-bit
+// checkpoint is written rounded, and everything downstream reads it back
+// through readFloats, so the reference and the kernels agree on the same
+// rounded numbers and nothing about a tolerance changes.
 class TensorFileWriter
 {
 public:
+    explicit TensorFileWriter(TensorType storageToUse = TensorType::F32)
+        : storage(storageToUse)
+    {
+    }
+
     void add(const SyntheticTensor& tensor)
     {
         const auto begin = (std::uint64_t) blob.size();
-        appendFloats(tensor.values);
+        appendValues(tensor.values);
 
         if (!header.empty())
             header += ",";
@@ -100,24 +111,47 @@ private:
         return text + "]";
     }
 
-    static std::string entryText(const SyntheticTensor& tensor,
-                                 std::uint64_t begin,
-                                 std::uint64_t end)
+    std::string entryText(const SyntheticTensor& tensor,
+                          std::uint64_t begin,
+                          std::uint64_t end) const
     {
-        return "\"" + tensor.name + "\":{\"dtype\":\"F32\",\"shape\":"
-               + shapeText(tensor.shape) + ",\"data_offsets\":["
+        return "\"" + tensor.name + "\":{\"dtype\":\""
+               + std::string {tensorTypeName(storage)}
+               + "\",\"shape\":" + shapeText(tensor.shape) + ",\"data_offsets\":["
                + std::to_string(begin) + "," + std::to_string(end) + "]}";
     }
 
-    void appendFloats(const Vector<float>& values)
+    std::uint16_t narrowed(float value) const
     {
-        const auto at = blob.size();
-        blob.resize(at + (int) sizeof(float) * values.size());
-        std::memcpy(blob.data() + at,
-                    values.data(),
-                    sizeof(float) * (std::size_t) values.size());
+        return storage == TensorType::BF16 ? eacp::GPU::bfloat16FromFloat(value)
+                                           : eacp::GPU::halfFromFloat(value);
     }
 
+    void appendValues(const Vector<float>& values)
+    {
+        const auto elementBytes = bytesPerElement(storage);
+        const auto at = blob.size();
+
+        blob.resize(at + elementBytes * values.size());
+
+        if (storage == TensorType::F32)
+        {
+            std::memcpy(blob.data() + at,
+                        values.data(),
+                        sizeof(float) * (std::size_t) values.size());
+
+            return;
+        }
+
+        for (auto index = 0; index < values.size(); ++index)
+        {
+            const auto bits = narrowed(values[index]);
+            std::memcpy(
+                blob.data() + at + index * elementBytes, &bits, sizeof(bits));
+        }
+    }
+
+    TensorType storage;
     std::string header;
     Vector<std::uint8_t> blob;
 };
@@ -238,18 +272,31 @@ using TensorEdit = std::function<void(Vector<SyntheticTensor>&)>;
 class SyntheticCheckpoint
 {
 public:
-    explicit SyntheticCheckpoint(
+    // The storage the tensors are written in, for the suites that run the same
+    // comparison over a checkpoint in Gemma's own BF16: what the file holds is
+    // what the loader uploads and what readFloats hands the reference, so both
+    // sides see the rounded values and the tolerance is the F32 one.
+    SyntheticCheckpoint(
         std::string_view name,
+        TensorType storage,
         Sharding sharding = Sharding::Single,
         TensorEdit edit = [](Vector<SyntheticTensor>&) {})
         : scratch(name)
         , modelConfig(smallGemmaConfig())
     {
-        write(sharding, edit);
+        write(storage, sharding, edit);
 
         files = ModelFiles::fromDirectory(scratch.path());
         modelConfig = GemmaConfig::fromModelFiles(files);
         tensors.emplace(ShardedTensors::fromModelFiles(files));
+    }
+
+    explicit SyntheticCheckpoint(
+        std::string_view name,
+        Sharding sharding = Sharding::Single,
+        TensorEdit edit = [](Vector<SyntheticTensor>&) {})
+        : SyntheticCheckpoint(name, TensorType::F32, sharding, std::move(edit))
+    {
     }
 
     const GemmaConfig& config() const { return modelConfig; }
@@ -263,7 +310,7 @@ private:
     static constexpr auto firstShardName = "model-00001-of-00002.safetensors";
     static constexpr auto secondShardName = "model-00002-of-00002.safetensors";
 
-    void write(Sharding sharding, const TensorEdit& edit)
+    void write(TensorType storage, Sharding sharding, const TensorEdit& edit)
     {
         scratch.writeText(ModelFileNames::config, configJson(modelConfig));
 
@@ -272,7 +319,7 @@ private:
 
         if (sharding == Sharding::Single)
         {
-            auto writer = TensorFileWriter {};
+            auto writer = TensorFileWriter {storage};
 
             for (const auto& tensor: all)
                 writer.add(tensor);
@@ -286,8 +333,8 @@ private:
         // the shape gemma-2b's own index has.
         const auto boundary = 1 + all.size() / 2;
 
-        auto first = TensorFileWriter {};
-        auto second = TensorFileWriter {};
+        auto first = TensorFileWriter {storage};
+        auto second = TensorFileWriter {storage};
         auto index = std::string {};
 
         for (auto at = 0; at < all.size(); ++at)

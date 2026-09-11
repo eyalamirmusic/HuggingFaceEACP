@@ -340,3 +340,45 @@ auto tShardedCheckpointDecodesTheSame =
 
     std::cout << "  two shards: worst error " << worst << "\n";
 };
+
+// The storage gemma-2b actually ships, which every weight here now keeps all
+// the way to the device: the same forward pass over a checkpoint written in
+// BF16, through the tiled product a prompt takes and the split product a token
+// takes, at the tolerance the F32 checkpoint is held to.
+//
+// The tolerance is unchanged because the storage is not a precision: the file
+// holds rounded values, readFloats hands the reference those same rounded
+// values, and the widening a kernel does on the way in is exact. What would
+// fail here is a packed read that landed on the wrong half of a word or a
+// fused weight whose two halves were stacked in the wrong storage — both of
+// which are wrong by whole digits rather than by the seventh.
+auto tBFloat16CheckpointMatchesReference =
+    test("Decoder/bfloat16CheckpointMatchesReference") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-bfloat16", TensorType::BF16};
+
+    const auto shape = checkpoint.shape();
+    const auto tokens = promptTokens();
+    const auto expected = decodeOnTheCpu(checkpoint, tokens);
+
+    auto prompt = DecoderRun {shape, checkpoint.weights()};
+
+    auto worst = checkStepAgainstReference(
+        prompt.step(tokens), expected, shape, 0, (int) tokens.size());
+
+    auto cached = DecoderRun {shape, checkpoint.weights()};
+
+    for (auto index = 0; index < (int) tokens.size(); ++index)
+    {
+        const auto result = cached.step({tokens[(std::size_t) index]});
+
+        worst = std::max(
+            worst, checkStepAgainstReference(result, expected, shape, index, 1));
+    }
+
+    std::cout << "  bf16 checkpoint: worst error " << worst << "\n";
+};

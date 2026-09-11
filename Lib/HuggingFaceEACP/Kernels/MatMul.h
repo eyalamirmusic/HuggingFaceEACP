@@ -4,19 +4,6 @@
 
 namespace HF
 {
-// What the weight operand's buffer holds. Nothing about a GPU::Buffer says
-// which of the two it is, so the kernel is told at compile time and the caller
-// picks the program that matches the buffer it loaded.
-//
-// Gemma ships bfloat16, which is neither of these: widening it to fp32 on the
-// CPU is what the loader does for now, and plan.md's first eacp gap is the
-// readBFloat16 that would make a third case here.
-enum class WeightStorage
-{
-    Float,
-    PackedHalf
-};
-
 // C = A * B + bias, all row-major: A is rowCount x innerCount, B is
 // innerCount x columnCount, C is rowCount x columnCount, and bias is one value
 // per output column, broadcast down every row — the shape a linear layer's
@@ -35,9 +22,9 @@ enum class WeightStorage
 //
 // B is the weight, and the only operand that can be packed: a model's weights
 // are what a repo ships narrow, and A, bias and C are the activations, which
-// this stack computes in float32 throughout. HalfWeightMatMul indexes the same
-// B by element and widens each on read, so the two forms take identical
-// uniforms and differ only in the buffer bound to b.
+// this stack computes in float32 throughout. The packed forms index the same B
+// by element and widen each on read, so all three take identical uniforms and
+// differ only in the buffer bound to b.
 template <WeightStorage weightStorage>
 struct MatMulProgram final : ComputeProgram
 {
@@ -63,12 +50,14 @@ struct MatMulProgram final : ComputeProgram
         write(output, row * columnCount + column, total.get() + bias[column]);
     }
 
-    // Exactly representable either way round, so the packed form is the same
+    // Exactly representable either way round, so a packed form is the same
     // number the widened one is rather than the same number to a tolerance.
     Float weight(const UInt& index)
     {
         if constexpr (weightStorage == WeightStorage::PackedHalf)
             return b.readHalf(index);
+        else if constexpr (weightStorage == WeightStorage::PackedBFloat16)
+            return b.readBFloat16(index);
         else
             return b[index];
     }
@@ -85,4 +74,5 @@ struct MatMulProgram final : ComputeProgram
 
 using MatMul = MatMulProgram<WeightStorage::Float>;
 using HalfWeightMatMul = MatMulProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightMatMul = MatMulProgram<WeightStorage::PackedBFloat16>;
 } // namespace HF

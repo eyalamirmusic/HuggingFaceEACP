@@ -11,11 +11,20 @@
 // all do without a device.
 //
 // This is the first test in the tree that asserts something about what the
-// model *says* rather than about a number: a base completion model given "The
-// capital of France is" continues with " Paris", and it is the one assertion
-// that fails if the loader, the tokenizer, the eighteen layers, the KV cache
-// and the greedy search are each nearly right. The tiers below it are what say
+// model *says* rather than about a number: the exact continuation greedy
+// gemma-2b gives "The capital of France is", which is the one assertion that
+// fails if the loader, the tokenizer, the eighteen layers, the KV cache and
+// the greedy search are each nearly right. The tiers below it are what say
 // which of them it was.
+//
+// The continuation is not " Paris", which is what this asserted until three
+// independent implementations were asked. At the last prompt position the base
+// model ranks "▁a" at -16.529 over "▁Paris" at -16.855 — a third of a logit,
+// so the sentence it continues into is "a city of contrasts" rather than the
+// answer to a question nobody asked it. Both llama.cpp over the F32 GGUF, in
+// Tests/Oracle, and transformers 5.17.0 in float32 and in bfloat16 produce
+// exactly these eight ids, so the expectation below is what the model says and
+// not what our arithmetic does.
 
 using namespace nano;
 using namespace HF;
@@ -30,8 +39,15 @@ bool hasRealCheckpoint()
 }
 
 // Small enough that a first run is seconds rather than a minute, and long
-// enough that a continuation has somewhere to put the word.
+// enough that a continuation is a clause rather than a word.
 constexpr auto smokeTokens = 8;
+
+// What greedy gemma-2b answers "The capital of France is" with, over those
+// eight tokens: ids 476, 3413, 576, 82777, 235265, 1165, 603, 476. Asserted as
+// the whole string rather than as a word in it, because the claim is that our
+// stack reproduces the reference token for token and a substring would pass on
+// a sequence that had drifted after the first few.
+constexpr auto capitalContinuation = " a city of contrasts. It is a";
 
 void reportTimings(const Gemma& gemma, int tokenCount)
 {
@@ -80,7 +96,7 @@ auto tGemmaGeneratesText = test("Generation/Gemma/completesAPrompt") = []
     std::cout << "  \"The capital of France is\" ->\"" << text << "\"\n";
     reportTimings(gemma, streamed.size());
 
-    check(text.find("Paris") != std::string::npos);
+    check(text == capitalContinuation);
 };
 
 // The two sampling paths over the real model, which is the one comparison that

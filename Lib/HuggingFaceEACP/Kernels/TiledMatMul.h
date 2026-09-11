@@ -521,6 +521,8 @@ struct TiledMatMulProgram final : ComputeProgram
     {
         if constexpr (bStorage == WeightStorage::PackedHalf)
             return b.readHalf(index);
+        else if constexpr (bStorage == WeightStorage::PackedBFloat16)
+            return b.readBFloat16(index);
         else
             return b[index];
     }
@@ -594,6 +596,8 @@ using TiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Float>;
 using HalfWeightTiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
+using BFloat16WeightTiledLinear =
+    TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedBFloat16>;
 using TiledMatMul =
     TiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxTiledMatMul = TiledMatMulProgram<OperandLayout::ContiguousN,

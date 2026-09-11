@@ -45,6 +45,21 @@ auto tTiledLinearPackedWeights = test("Kernels/tiledLinearPackedWeights") = []
     TiledProduct::checkPackedLinear<HalfWeightTiledLinear>(37, 21, 35, 400u);
 };
 
+// The storage Gemma actually ships, and the bit-for-bit agreement with the
+// float product that is what makes it a storage choice rather than a
+// precision one — see checkPackedBFloat16Linear.
+auto tTiledLinearBFloat16Weights = test("Kernels/tiledLinearBFloat16Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightTiledLinear, TiledLinear>(
+        37, 21, 35, 400u);
+
+    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightTiledLinear, TiledLinear>(
+        70, 50, 45, 410u);
+};
+
 // Attention scores as a decoder computes them — 35 queries over three heads
 // against a cache of 39 keys, scaled and causally masked over the trapezoid
 // that leaves, where query 0 stands at position 4.

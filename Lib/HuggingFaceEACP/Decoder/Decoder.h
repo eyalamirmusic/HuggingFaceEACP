@@ -48,12 +48,13 @@ namespace HF
 // One program of each kind serves every layer: the shapes are uniforms, so
 // eighteen layers of two norms, four projections and an attention are
 // re-bindings of a handful of pipelines rather than pipelines of their own. The
-// products are the exception, and are held six ways over three questions: a
-// float-weight program and a packed-half one, so a weight the loader left fp16
-// is dispatched through the program that reads fp16; the many-row tiled form a
-// prompt takes against the few-row split form a decode step takes; and, inside
-// that split form, the split count the shape wants — see stepSplitCount and
-// logitsSplitCount below.
+// products are the exception, and are held nine ways over three questions: what
+// the weight's buffer holds — floats, packed halves or packed bfloat16s, since
+// a program can only read the one it was compiled for; the many-row tiled form
+// a prompt takes against the few-row split form a decode step takes; and,
+// inside that split form, the split count the shape wants — see stepSplitCount
+// and logitsSplitCount below. The embedding gather is held three ways for the
+// first of those questions alone.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -129,25 +130,47 @@ private:
     // of rows the extra weight traffic is the whole cost of a bandwidth-bound
     // step — which puts the crossover low. A decode step is one row; three is
     // a speculative triple.
+    //
+    // Measured on gemma-2b on an M5 Max, as what one prefill block of that
+    // many rows costs: one row is 25 ms split against the tiled product's 65,
+    // two 42 against 59, three 59 against 57, and four 77 against 53. The
+    // crossover is between two and three rows, so three is where the two forms
+    // meet and every row past it belongs to the tiled product.
     static constexpr auto splitRowLimit = 3;
 
     // How many lanes share one output's inner sum in a step's projections.
-    // Unmeasured on Gemma's widths: WhisperEACP measured 96 over a 384-wide
-    // row, and 2048 wide with 16384 outputs is a different curve. plan.md's
-    // fifth step is where both of these get a number rather than a guess.
+    //
+    // Measured on gemma-2b on an M5 Max, 64 tokens from a short prompt, best
+    // of five runs: 16 lanes give 49.9 tokens/s, 32 give 51.9, 64 give 50.8,
+    // 128 give 52.1, 256 and 512 give 53.2, and 1024 halves it to 26.7. The
+    // curve is flat because a decode step reads every weight once at around
+    // 500 GB/s and is bandwidth bound whatever the lane count — which is why
+    // keeping the weights packed as bf16, which halves that traffic, is what
+    // took the rate to about 106 tokens/s, not any number here. Those were
+    // measured over the widened fp32 weights; the shape of the curve is the
+    // same claim over the packed ones. 64 stays: the three to five percent
+    // 256 and 512 add on a 40-core device is not worth a group four times
+    // wider, which a smaller GPU holds fewer of in flight.
     static constexpr auto stepSplitCount = 64;
 
     // The logits projection wants fewer. Its 256,000 outputs fill the device at
     // any split count, so the only thing more lanes buy is a longer fold —
-    // WhisperEACP measured 32 the floor of that curve over a 51,864-wide row.
+    // WhisperEACP measured 32 the floor of that curve over a 51,864-wide row,
+    // and Gemma's 256,000-wide one is flatter still: every count from 8 to 256
+    // lands between 50.5 and 51.4 tokens/s, which is inside the run-to-run
+    // spread.
     static constexpr auto logitsSplitCount = 32;
 
     // A decode step's norms are one row of 2048 with nothing else on the
     // machine, so what is wanted is the widest group that still has work for
-    // every lane: 256 is eight elements a lane. Unmeasured here too, and the
-    // count is a parameter for the reason RMSNorm.h gives — a prompt step's
-    // rows fill the machine on their own, where a wider group only adds
-    // barriers.
+    // every lane: 256 is eight elements a lane. The count is a parameter for
+    // the reason RMSNorm.h gives — a prompt step's rows fill the machine on
+    // their own, where a wider group only adds barriers.
+    //
+    // Measured on gemma-2b on an M5 Max: 32 lanes give 48.7 tokens/s, 64 give
+    // 50.0, 128 give 50.8, 256 give 51.8, 512 give 52.0, and 1024 — which
+    // Metal dispatches without complaint — give 51.0. The curve is flat from
+    // 128 up and 256 sits on it.
     static constexpr auto normLanes = 256;
 
     void requireMatchingWeights(const DecoderWeights& weights) const;
@@ -168,6 +191,14 @@ private:
                         int rowStride,
                         int headCount,
                         int rowCount);
+
+    // The gather, through whichever of the three programs reads the storage the
+    // embedding arrived in. The table is the tied logits weight as well, so
+    // this and the logits product read the one buffer.
+    void encodeEmbed(eacp::GPU::ComputePass& pass,
+                     const eacp::GPU::BufferRange& tokens,
+                     const TensorBuffer& table,
+                     int tokenCount);
 
     void encodeNorm(eacp::GPU::ComputePass& pass,
                     const eacp::GPU::Buffer& input,
@@ -199,13 +230,18 @@ private:
     int decodedPositions = 0;
 
     Embed embedding;
+    HalfWeightEmbed packedEmbedding;
+    BFloat16WeightEmbed bfloatEmbedding;
     RMSNorm normalisation {normLanes};
     LinearProduct product;
     HalfWeightLinearProduct packedProduct;
+    BFloat16WeightLinearProduct bfloatProduct;
     SplitLinear splitProjection {stepSplitCount};
     HalfWeightSplitLinear packedSplitProjection {stepSplitCount};
+    BFloat16WeightSplitLinear bfloatSplitProjection {stepSplitCount};
     SplitLinear splitLogits {logitsSplitCount};
     HalfWeightSplitLinear packedSplitLogits {logitsSplitCount};
+    BFloat16WeightSplitLinear bfloatSplitLogits {logitsSplitCount};
     RoPE rotation;
     GeGLU gating;
     MultiQueryPrefillAttention prefillAttention;

@@ -23,12 +23,14 @@ using TensorShape = std::initializer_list<int>;
 // "layer 3" — so a refusal says which part of the model would not take the
 // checkpoint rather than leaving that to a stack trace.
 //
-// **Packed storage.** A projection weight may stay packed as fp16: the product
-// kernels have a half-reading variant and the caller picks it by
-// TensorBuffer::storage. Every other tensor is bound to a program with no half
-// read, so a packed one there would be wrong by a factor of two in every index
-// while staying silent, and loadFloatTensor refuses it. Gemma's own weights
-// are BF16, which has no shader read at all yet and therefore arrives widened.
+// **Packed storage.** A weight a product or the embedding gather reads may stay
+// packed as it lies in the checkpoint — fp16 or Gemma's own bf16 — because
+// those kernels have a variant per storage and the caller picks it by
+// TensorBuffer::storage. The norm scales are the exception: RMSNorm subscripts
+// floats and has no packed read, so a packed one there would be read at half
+// the stride it was written at, silently, on both backends. loadFloatTensor
+// widens those on the way up, which is kilobytes for a row of a weight rather
+// than the copy of a matrix the packed path exists to avoid.
 struct TensorLoader
 {
     const ShardedTensors& file;
@@ -39,19 +41,13 @@ struct TensorLoader
     void checkShape(const TensorInfo& tensor, Span<const int> expected) const;
     void checkShape(const TensorInfo& tensor, TensorShape expected) const;
 
-    void rejectPackedHalf(const TensorBuffer& loaded,
-                          const std::string& name,
-                          std::string_view reader) const;
-
-    // Bound to a program that subscripts a float buffer, so a packed one would
-    // be read at half the stride it was written at — silently, on both
-    // backends. `reader` is the kernel the refusal names.
+    // Widened to F32 whatever the checkpoint holds, for the tensors bound to a
+    // program that subscripts a float buffer.
     TensorBuffer loadFloatTensor(const std::string& name,
-                                 TensorShape expected,
-                                 std::string_view reader) const;
+                                 TensorShape expected) const;
 
-    // A projection weight, which is the one operand that may stay packed.
-    TensorBuffer loadProjectionWeight(const std::string& name,
-                                      TensorShape expected) const;
+    // A weight, which reaches the device in the storage the checkpoint shipped
+    // it in.
+    TensorBuffer loadWeight(const std::string& name, TensorShape expected) const;
 };
 } // namespace HF

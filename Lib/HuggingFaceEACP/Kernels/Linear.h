@@ -60,12 +60,14 @@ struct LinearProgram final : ComputeProgram
         write(output, row * outputWidth + column, total.get() + bias[column]);
     }
 
-    // Exactly representable either way round, so the packed form is the same
+    // Exactly representable either way round, so a packed form is the same
     // number the widened one is rather than the same number to a tolerance.
     Float weight(const UInt& index)
     {
         if constexpr (weightStorage == WeightStorage::PackedHalf)
             return weights.readHalf(index);
+        else if constexpr (weightStorage == WeightStorage::PackedBFloat16)
+            return weights.readBFloat16(index);
         else
             return weights[index];
     }
@@ -82,6 +84,7 @@ struct LinearProgram final : ComputeProgram
 
 using Linear = LinearProgram<WeightStorage::Float>;
 using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightLinear = LinearProgram<WeightStorage::PackedBFloat16>;
 
 // The same product for a handful of rows — a decode step's one token, or the
 // prompt's two — where a thread per output is a thread per 2048 or 16384
@@ -96,8 +99,8 @@ using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
 // It sets both how much of the inner sum a lane walks and how many groups the
 // dispatch has, and the second is what a decode step is short of. The caller
 // names the count its shapes want, the way ReducingProgram takes its lane
-// count; the two Gemma will want are a projection's and the logits', both of
-// which have to be measured rather than guessed.
+// count; the two Gemma wants are a projection's and the logits', and what each
+// of them measures to is in Decoder.h beside the counts themselves.
 //
 // A group is splitCount lanes by however many outputs 64 threads then hold,
 // and one output at or past 64. At one output the fold is groupSum(), which is
@@ -228,17 +231,22 @@ struct SplitLinearProgram final : ComputeProgram
     {
         if constexpr (weightStorage == WeightStorage::PackedHalf)
             return weights.readHalf(index);
+        else if constexpr (weightStorage == WeightStorage::PackedBFloat16)
+            return weights.readBFloat16(index);
         else
             return weights[index];
     }
 
     // Four consecutive weights from a four-aligned index: one record of the
-    // float buffer, or the two words that hold four halves.
+    // float buffer, or the two words that hold four of either 16-bit float.
     Float4 weight4(const UInt& index)
     {
         if constexpr (weightStorage == WeightStorage::PackedHalf)
             return float4(weights.readHalf2(index / 2u),
                           weights.readHalf2(index / 2u + 1u));
+        else if constexpr (weightStorage == WeightStorage::PackedBFloat16)
+            return float4(weights.readBFloat16x2(index / 2u),
+                          weights.readBFloat16x2(index / 2u + 1u));
         else
             return weights.read4(index / 4u);
     }
@@ -272,4 +280,5 @@ struct SplitLinearProgram final : ComputeProgram
 
 using SplitLinear = SplitLinearProgram<WeightStorage::Float>;
 using HalfWeightSplitLinear = SplitLinearProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightSplitLinear = SplitLinearProgram<WeightStorage::PackedBFloat16>;
 } // namespace HF

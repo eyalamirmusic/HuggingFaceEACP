@@ -27,9 +27,10 @@
 // This is the deepest claim the suite can make. Between a token and a logit,
 // everything is ours on one side and the reference's on the other — eighteen
 // layers of independently written arithmetic — and, unlike WhisperEACP's
-// version of this comparison, both sides hold the same weights at the same
-// width: the GGUF is the F32 conversion of the same safetensors our loader
-// widens from BF16, so a disagreement is arithmetic rather than a format.
+// version of this comparison, both sides hold the same numbers: the GGUF is the
+// F32 conversion of the same BF16 safetensors we read, and widening a bf16 is
+// exact whether ggml does it once on the CPU or a kernel does it on every read,
+// so a disagreement is arithmetic rather than a format.
 //
 // **Which assertion is the real one.** The argmax of every row and the set of
 // its five largest tokens. That is what a generation step consumes, and it is
@@ -40,14 +41,15 @@
 // bits — nor do exp, rsqrt and tanh, which are the backend's rather than
 // libm's.
 //
-// **The elementwise bound is provisional.** isClose(a, e, 2e-3) allows
-// |a - e| <= 2e-3 * (1 + |e|), which at a logit of 20 is about 0.04. Nothing
-// has run this yet, so that number is an expectation and not a measurement:
-// what a run should be read for is the max |a - e| each test prints, and the
-// bound replaced with a stated multiple of it the way Tests/Decoder's 5e-6 is
-// a multiple of its own measured 2.1e-7. If the elementwise check fails while
-// the argmax and the top five agree, the tolerance is what is wrong; if the
-// argmax disagrees, we are.
+// **The elementwise bound is measured.** isClose(a, e, t) allows
+// |a - e| <= t * (1 + |e|). The first run of this suite against the F32 GGUF
+// measured a worst |a - e| of 0.043 over logits reaching 113, which is 4e-4 of
+// the row's range, and a worst |a - e| / (1 + |e|) of 1.02e-2 — the largest
+// gap and the largest ratio are not the same element, and the ratio's is a
+// logit near 3 where the denominator is small. The bound below is five times
+// that measurement, the way Tests/Decoder's 5e-6 is a multiple of its own
+// measured 2.1e-7. If the elementwise check fails while the argmax and the top
+// five agree, the tolerance is what is wrong; if the argmax disagrees, we are.
 //
 // Everything skips without a device, without a checkpoint, and without the
 // GGUF beside the safetensors — which the fetched mirror does not carry, so it
@@ -67,8 +69,8 @@ namespace
 // runs out first, and so the two are the same claim about the same window.
 constexpr auto oracleWindow = LlamaOracle::defaultContextSize;
 
-// See the note above: an expectation, not a measurement.
-constexpr auto logitTolerance = 2e-3;
+// See the note above: five times the 1.02e-2 the first run measured.
+constexpr auto logitTolerance = 5e-2;
 
 // How many of a row's largest tokens have to be the same set. Five is past
 // where a sampler's top-k usually cuts and far enough down the row that
@@ -77,6 +79,13 @@ constexpr auto topTokens = 5;
 
 constexpr auto capitalPrompt = std::string_view {"The capital of France is"};
 constexpr auto greedySteps = 8;
+
+// What the two sides agree the model says, asserted here as well as against
+// llama.cpp's own tokens so a run where both had drifted the same way would
+// still have to drift onto this string. transformers 5.17.0 in float32 is the
+// third implementation that gives it.
+constexpr auto capitalContinuation =
+    std::string_view {" a city of contrasts. It is a"};
 
 // Three prompts rather than one: a bare noun phrase, a sentence with
 // punctuation and digits, and the one the greedy test continues. Tokenized by
@@ -187,10 +196,10 @@ private:
     Decoder decoder;
 };
 
-// One of these for the executable. The weights are ten gigabytes of BF16
-// widened to F32 on the way to the device and preparing compiles every kernel,
-// so a second would double a run that already holds llama.cpp's ten gigabytes
-// beside it — the same reason sharedOracle() in Common.h is one oracle.
+// One of these for the executable. The weights are five gigabytes of BF16 kept
+// packed on the way to the device and preparing compiles every kernel, so a
+// second would double a run that already holds llama.cpp's ten gigabytes beside
+// it — the same reason sharedOracle() in Common.h is one oracle.
 //
 // Every test below opens with beginSequence(), so sharing one carries no state
 // from the test before it.
@@ -575,8 +584,7 @@ auto tGreedyContinuationAgrees = test("Oracle/Decoder/greedyContinuationAgrees")
               << spelled(generated) << ", llama.cpp " << spelled(expected) << "\n";
 
     check(sameTokens(generated, expected), "the greedy continuations agree");
-    check(text.find("Paris") != std::string::npos,
-          "Paris arrives within eight tokens");
+    check(text == capitalContinuation, "and are what gemma-2b says");
 };
 
 // plan.md's "confirm every number against config.json", from the other side:

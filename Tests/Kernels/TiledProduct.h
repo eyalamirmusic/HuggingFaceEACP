@@ -189,6 +189,43 @@ void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
             a, widened, bias, shape, OperandLayout::ContiguousK, rows * columns));
 }
 
+// The bf16 form, asserted twice over: against the same scalar reference the
+// float product answers to, and against the float product itself.
+//
+// The second is the property the packed path is worth having for. Widening a
+// bf16 is the sixteen bits back at the top of a word and nothing else, so the
+// two programs multiply and add identical float32 numbers in identical order,
+// and "the same answer" means bit for bit rather than to a tolerance. A packed
+// read that dropped a bit, picked the wrong half of a word or rounded on the
+// way in would still pass a tolerance and fails this.
+template <typename Program, typename FloatProgram>
+void checkPackedBFloat16Linear(int rows, int inner, int columns, unsigned seed)
+{
+    auto shape = TiledMatMulShape::forLinear(rows, inner, columns);
+    auto a = spreadValues(rows * inner, seed, 2.f);
+    auto weights = spreadValues(columns * inner, seed + 1u, 3.f);
+    auto bias = spreadValues(columns, seed + 2u, 1.f);
+
+    auto widened = Vector<float> {};
+    auto packed = packedBFloat16Storage(weights, widened);
+
+    auto kernel = Program {};
+    auto result = run(kernel, a, packed, bias, shape, rows * columns);
+
+    checkMatches(
+        result,
+        reference(
+            a, widened, bias, shape, OperandLayout::ContiguousK, rows * columns),
+        dotProductTolerance(inner));
+
+    auto floatKernel = FloatProgram {};
+    auto floatResult =
+        run(floatKernel, a, storageOf(widened), bias, shape, rows * columns);
+
+    for (auto i = 0; i < result.size(); ++i)
+        nano::check(result[i] == floatResult[i]);
+}
+
 // Attention scores as a decoder computes them: one batch per head over the
 // head's slice of the query and key rows, scaled, and causally masked over a
 // cache's trapezoid, where query m stands at keys - queries + m.

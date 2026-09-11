@@ -36,9 +36,16 @@ namespace HF
 // wrote at the end of one step be the id this reads at the start of the next
 // without a trip through the host: a vocabulary is indexed, not measured, and
 // the buffer's element type says so on both backends.
-struct Embed final : ComputeProgram
+//
+// The table is the one operand a checkpoint decides the storage of, and it is
+// the same buffer the tied logits product reads — so this reads it in whatever
+// the loader left it in, which for Gemma is packed bfloat16. A gather is a
+// read and a multiply whatever the element is, so the three forms differ only
+// in the buffer bound to tokenTable.
+template <WeightStorage tableStorage>
+struct EmbedProgram final : ComputeProgram
 {
-    Embed() { compile(); }
+    EmbedProgram() { compile(); }
 
     void define() override
     {
@@ -48,9 +55,17 @@ struct Embed final : ComputeProgram
 
         auto token = tokens[step];
 
-        write(output,
-              step * width + channel,
-              scale * tokenTable[token * width + channel]);
+        write(output, step * width + channel, scale * row(token * width + channel));
+    }
+
+    Float row(const UInt& index)
+    {
+        if constexpr (tableStorage == WeightStorage::PackedHalf)
+            return tokenTable.readHalf(index);
+        else if constexpr (tableStorage == WeightStorage::PackedBFloat16)
+            return tokenTable.readBFloat16(index);
+        else
+            return tokenTable[index];
     }
 
     Uniform<UIntInputBuffer> tokens;
@@ -61,4 +76,8 @@ struct Embed final : ComputeProgram
 
     EACP_SHADER(tokens, tokenTable, output, width, scale)
 };
+
+using Embed = EmbedProgram<WeightStorage::Float>;
+using HalfWeightEmbed = EmbedProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightEmbed = EmbedProgram<WeightStorage::PackedBFloat16>;
 } // namespace HF

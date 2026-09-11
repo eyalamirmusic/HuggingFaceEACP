@@ -69,9 +69,14 @@ model. The mirror is **unsharded**: one 5.0 GB `model.safetensors` in place of
 the two shards and the index above. It carries `tokenizer.model` too, though
 the fetch does not take it — nothing here reads the SentencePiece original —
 and what it has no copy of at all is `gemma-2b.gguf`. The GGUF is what
-`Tests/Oracle` reads, and it is the one thing
-still worth doing Google's gated download for; `GEMMA_MODEL_DIR` is how a
-machine that has done it says so.
+`Tests/Oracle` reads, and it turns out not to need Google's download either:
+`convert_hf_to_gguf.py` from llama.cpp at the same pinned tag `b10900` turns
+the mirror's safetensors into the 10 GB F32 GGUF, so the oracle reads a file
+its own converter wrote from the same bytes our loader reads. The converter
+wants `tokenizer.model`, `tokenizer_config.json` and `special_tokens_map.json`
+beside the four fetched files, which the mirror carries and the fetch does not
+take. `GEMMA_MODEL_DIR` is how a machine that has done the conversion says so;
+on this one it is `~/Models/gemma-2b`.
 
 `gemma-2b` is the base completion model. `gemma-2b-it` is the same architecture
 with a chat prompt format, so supporting both is a prompt change only.
@@ -136,8 +141,8 @@ matrix product, which is already the fast path.
 
 | weight storage | bytes per token | rough ceiling on an M5 Max |
 | --- | --- | --- |
-| fp32 (what widening BF16 on the CPU gives today) | 10 GB | ~50 tokens/s |
-| bf16 kept packed | 5 GB | ~100 tokens/s |
+| fp32 (what widening BF16 on the CPU gave until gap 1) | 10 GB | ~50 tokens/s, measured 51–55 |
+| bf16 kept packed (what the loader does now) | 5 GB | ~100 tokens/s, measured 105–108 |
 | int8 or int4 blocks, later | 1.3 to 2.5 GB | 200 to 400 tokens/s |
 
 A step is roughly 18 layers × a dozen dispatches, a few hundred per token,
@@ -145,28 +150,49 @@ which is the same order as the Whisper decoder's step.
 
 ## What eacp is missing, ranked
 
-1. **A BF16 read in the EDSL.** The one that matters. Gemma ships BF16 and
-   WhisperEACP's loader widens it to fp32 on the CPU, which doubles the weights
-   on the GPU and halves decode speed. Converting to fp16 instead is lossy:
-   bf16 has an 8-bit exponent and fp16 a 5-bit one, so small weights flush and
-   nothing is bit-exact against the reference. The fix mirrors `readHalf`:
-   `readBFloat16(i)`, a two-wide sibling, and pack/unpack helpers. Widening is
-   an integer shift and `asFloat`, so it is exact and identical on MSL, HLSL at
-   `cs_5_0` and GLSL, with none of the narrowing divergence fp16 has if the
-   rounding is done in integer arithmetic. A small change, with `Tests/GPU`
-   coverage in the style of the `readHalf` tests. Downstream, `WeightStorage`
-   gains a BF16 case and the product kernels a third variant.
+1. **A BF16 read in the EDSL. Done, on eacp `develop`.** The one
+   that mattered. Gemma ships BF16 and WhisperEACP's loader widened it to fp32
+   on the CPU, which doubled the weights on the GPU and halved decode speed.
+   Converting to fp16 instead is lossy: bf16 has an 8-bit exponent and fp16 a
+   5-bit one, so small weights flush and nothing is bit-exact against the
+   reference. The fix mirrors `readHalf` exactly as planned: `readBFloat16(i)`,
+   `readBFloat16x2`, `unpackBFloat16x2` / `packBFloat16x2`, a
+   `writeBFloat16x2`, and host-side `bfloat16FromFloat` / `bfloat16ToFloat`.
+   Widening is a shift and a bitcast, so it is exact and identical on MSL,
+   HLSL and GLSL, and the narrowing is round-to-nearest-even in integer
+   arithmetic with NaN quieted, so — unlike `packHalf2` — it is bit-identical
+   across the backends too. `Tests/GPU/PackedBFloat16Tests.cpp` covers it in
+   the style of the `readHalf` tests, including the subnormal-in-fp16 values
+   that were the point. Downstream, `WeightStorage` has its third case,
+   `PackedBFloat16`, and every product carries it — `Linear`, `SplitLinear`,
+   `MatMul`, the register-tiled and SIMD-group tiled forms — as does the
+   embedding gather, since the tied embedding is one buffer read by both the
+   gather and the logits product. The loader uploads BF16 as it lies in the
+   blob: two little-endian 16-bit values to a word is already the layout the
+   read indexes. Only the norm scales are still widened on the way up, a row
+   of 2048 each. The device holds 5.0 GB of weights instead of 10 GB, the
+   embedding is 1.05 GB bound twice, and the continuation is unchanged to the
+   character, which `Tests/Kernels` asserts for every product: a packed
+   product is bit-identical to the float product over the same widened
+   weights. Measured with `Generate "The capital of France is" --max-tokens
+   16`: Debug went from 34.8 s to load and 54 tokens/s to 12.4 s and 108;
+   Release from 1.36 s and 55 tokens/s to 0.89 s and 106. Nothing here
+   *writes* bf16 yet — activations, the KV cache and the logits stay fp32 —
+   so the pack side is unused.
 2. **`GPU::Buffer` sizes are `int`.** WhisperEACP's plan recorded this as the
    maintainer's decision, and for 2B in BF16 it holds: the embedding is
-   1.05 GB. Widened to fp32 it is 2.10 GB, 50 MB under the limit, and a 7B
-   embedding in fp32 is past it. If item 1 lands this is not blocking for 2B;
-   it blocks anything larger, or any fp32 path. Widen `Buffer`, `BufferRange`,
+   1.05 GB. Widened to fp32 it was 2.10 GB, 50 MB under the limit, and a 7B
+   embedding in fp32 is past it. Now that item 1 has landed this is not
+   blocking for 2B's weights; it blocks anything larger, any fp32 path, and
+   the logits buffer at a prompt capacity of 2048 rows (see below). Widen
+   `Buffer`, `BufferRange`,
    `read` and `update` to 64-bit before 7B rather than after. Shader-side
    indexing is 32-bit and fine: the biggest tensor is 524 M elements.
 3. **Zero-copy weight buffers on Metal.** `Buffer` always copies through
    `newBufferWithBytes`, so loading is a 5 GB memcpy and, while the mapping and
    the buffer both exist, 10 GB resident. Fine on 128 GB, painful on a 16 GB
-   laptop. Metal can wrap a page-aligned mapping with
+   laptop. With gap 1 filled this copy is the largest part of startup — most
+   of the 12 s a Debug load still takes. Metal can wrap a page-aligned mapping with
    `newBufferWithBytesNoCopy`, and every tensor would then be a `BufferRange`
    into one buffer over the whole shard (offsets are 4-byte aligned, which the
    ranged bind needs; check per tensor). D3D12 has no equivalent and keeps
@@ -179,10 +205,10 @@ which is the same order as the Whisper decoder's step.
    so `HF_EACP_FETCH_MODEL` fetches the four files from it at a pinned commit,
    `hf_bundle_model(<target>)` copies them beside a binary, and
    `Gemma::loadBundled()` finds the copy. Nothing has to be arranged by hand.
-   `GEMMA_MODEL_DIR` stays as the explicit override, and is what a machine that
-   *has* done Google's gated download names it with — the GGUF beside the
-   safetensors is the one thing the mirror does not carry, and `Tests/Oracle`
-   reads it.
+   `GEMMA_MODEL_DIR` stays as the explicit override, and is what a machine
+   names a directory with the converted GGUF beside the safetensors with — the
+   GGUF is the one thing the mirror does not carry, `Tests/Oracle` reads it,
+   and llama.cpp's own converter writes it from the mirror.
 5. **Threading.** eacp's GPU layer is main-thread only. Two hundred tokens at
    10 ms each is two seconds of message thread if driven synchronously.
    `commitAsync` and the scoped wait exist, so record several steps per command
@@ -222,9 +248,9 @@ Found while writing steps 3 and 4, unranked:
   `promptCapacity × 256000 × 4` bytes: 524 MB at the default 512 rows, and
   2048 rows is past what an `int` describes. `Gemma::prepare` counts it in
   64 bits and refuses with a `ModelError` naming this gap rather than
-  truncating the allocation. The widened F32 embedding, 2.10 GB, is bound
-  twice — as the gather's table and as the tied logits weight — and sits
-  50 MB under the limit.
+  truncating the allocation. The embedding is bound twice — as the gather's
+  table and as the tied logits weight — and was 2.10 GB widened, 50 MB under
+  the limit; packed since gap 1 it is 1.05 GB.
 - **`commitAsync` cannot drive a generation loop.** Its `Async` resolves on
   the main thread, and a loop that never returns to the run loop never sees
   it — eacp's own header says so. `submit()` and the scoped
@@ -238,11 +264,11 @@ Found while writing steps 3 and 4, unranked:
   ring before it returns; WhisperEACP's `Whisper` carries the same latent
   race. A `Buffer::update` that waited for in-flight writers, or a documented
   rule that it does not, belongs in eacp.
-- **No raw-bytes concatenation in the loader.** Fusing gate and up goes through
-  `readFloats`, so an fp16 repo pays a widened copy of the largest weight per
-  layer where a packed stack would have kept it half the size. Costs Gemma's
-  BF16 checkpoint nothing, since it is widened regardless; gone once gap 1
-  lands and the packed read exists. Ours, not eacp's, but decided by gap 1.
+- **No raw-bytes concatenation in the loader. Gone with gap 1.** Fusing gate
+  and up went through `readFloats`, so a packed repo paid a widened copy of
+  the largest weight per layer. `loadFusedGateUp` now stacks the two tensors'
+  raw bytes whenever both share a packed storage and each half is a whole
+  number of words, and widens only otherwise, which no real shape reaches.
 
 Already filled since the Whisper rounds: 3D dispatch exists, so the head no
 longer has to be folded into the dispatch row; `CommandTimer` times
@@ -284,10 +310,20 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    prefill and token-by-token logits against its rows, an eight-token greedy
    continuation, and the config's numbers against the GGUF's header, which is
    what retires the "confirm every number" caveat above. Every one of them
-   still skips until `GEMMA_MODEL_DIR` names a directory holding
-   `gemma-2b.gguf`, which is Google's own gated download and not the mirror the
-   build fetches, so the elementwise tolerance there is provisional and the
-   argmax and top-5 agreement is the assertion that matters. What changed
+   skips until `GEMMA_MODEL_DIR` names a directory holding `gemma-2b.gguf`,
+   converted from the mirror as described under the repo above. **They have
+   now run, and all nine pass**: the tokenizer agrees with llama.cpp's piece
+   for piece on all sixteen cases; the argmax and the five largest tokens of
+   every row agree on three prefill prompts, on the same prompt fed one token
+   at a time through the KV cache, and over an eight-step greedy loop where
+   neither side sees the other's choice; and the GGUF's header matches
+   `config.json` on every number it carries — `gemma.rope.freq_base` is
+   absent, since llama.cpp's Gemma converter never writes it, so `rope_theta`
+   stays unchecked from that side. The elementwise bound is no longer
+   provisional: the run measured a worst |a − e| of 0.0427 over logits
+   reaching 113.4, and a worst |a − e| / (1 + |e|) of 1.02e-2, so
+   `logitTolerance` is 5e-2, five times the measurement, the way
+   `Tests/Decoder`'s 5e-6 is a multiple of its 2.1e-7. What changed
    against the plan:
    gate and up are concatenated at load into one `[32768, 2048]` weight, so
    the MLP is one product, one GeGLU and the down product with the residual
@@ -315,22 +351,47 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
      treats an explicit null as the default and only an absent key defers to
      the older spelling. Nothing dispatches on the value; it is recorded.
    - The 256 byte pieces are 255. See item 1 above: id 226 is a literal tab.
-   - **Greedy from "The capital of France is" does not reach Paris.** It
-     produces `" a city of contrasts. It is a city of history, of art, of"`,
-     which is fluent and on-topic, so the whole stack is doing something
-     coherent — but `Generation/Gemma/completesAPrompt` asserts `Paris` and
-     that assertion fails. Unresolved and deliberately left failing: whether
-     this is our arithmetic or what greedy gemma-2b actually says is exactly
-     what `Tests/Oracle` is for, and it needs the GGUF the mirror does not
-     carry. That is now the top open question.
+   - **Greedy from "The capital of France is" does not reach Paris, and
+     never did.** It produces `" a city of contrasts. It is a city of
+     history, of art, of"`, and `Generation/Gemma/completesAPrompt` asserted
+     `Paris`. Whether that was our arithmetic or the model was the top open
+     question until three implementations were asked, and all three give the
+     same sixteen ids: ours on the GPU, llama.cpp `b10900` over the F32 GGUF,
+     and transformers 5.17.0 on the CPU in float32 and again in bfloat16. At
+     the last prompt position the base model ranks `▁a` at −16.529 ahead of
+     `▁Paris` at −16.855, a third of a logit, with `▁the`, `▁one` and `▁also`
+     behind them; a completion model given a noun phrase continues the
+     sentence rather than answering the question. The test and the two oracle
+     tests now assert that exact string, as a whole rather than a word in it,
+     so a sequence that drifted after the first few tokens fails.
 
    Timings, Debug, one M-series device, 16 tokens from a 6-token prompt: 38 s
-   to load and upload (the BF16 widening on the CPU, which is gap 1), 0.36 s
-   of prefill, and 0.29 s of decode — about 56 tokens/s.
-5. Performance rounds: the BF16 read lands in eacp first, since it decides the
-   whole memory budget; then the fused GeGLU, the split counts (the decoder's
-   64 and 32 are WhisperEACP's numbers, unmeasured on Gemma's widths), and
-   the prompt-capacity and lane-count guesses.
+   to load and upload (the BF16 widening on the CPU, which was gap 1), 0.36 s
+   of prefill, and 0.29 s of decode — about 56 tokens/s. In Release the load
+   was 1.4 s and decode the same 55 tokens/s: every number past loading is
+   GPU-bound, so the tuning below can be measured in either build.
+5. **The first round is done.** The BF16 read landed in eacp first, as gap 1
+   above records, and took decode from 55 to 106 tokens/s. The tuning
+   numbers were then measured on an M5 Max, and **none of them moved**,
+   because a decode step is bandwidth bound and no constant changes that:
+   over the widened weights it read 10 GB a token at about 515 GB/s, which is
+   the machine. Best of five runs of 64 generated tokens: `stepSplitCount`
+   gives 49.9 tokens/s at 16 lanes, 51.9 at 32, 50.8 at the default 64, 52.1
+   at 128, 53.2 at 256 and 512, and 26.7 at 1024 — a three to five percent
+   plateau above 64 that is not worth a group four times wider, so 64 stands.
+   `logitsSplitCount` is flat from 8 to 256 (50.5 to 51.4), the 256,000
+   outputs filling the device at any count, so 32 stands. `normLanes` gives
+   48.7 through 52.0 at 32 through 512 and 51.0 at 1024, flat from 128 up,
+   so 256 stands. `splitRowLimit` was measured by prefilling a 289-token
+   prompt in blocks of that many rows through each form: one row is 25 ms
+   split against 65 ms tiled, two 42 against 59, three 59 against 57, four 77
+   against 53, eight 159 against 60 — the crossover is exactly at three rows.
+   The prefill block is the same story: that prompt prefills in 0.367 s at 64
+   rows a block, 0.312 at 128, 0.307 at 256, 0.286 at 512 and 0.271 at 1024,
+   where 512 and 1024 are one block either way, so 512 stands. The comments
+   beside each constant carry these numbers. Left for the next round: the
+   fused GeGLU, and re-measuring the split counts over the packed weights,
+   where the curves should keep their shape at twice the rate.
 6. **Half done.** `Sampling` is the CPU sampler — temperature, top-k, top-p in
    Hugging Face's processor order, a seeded draw the standard specifies so a
    seed means the same token sequence on every machine — and a temperature
@@ -340,14 +401,13 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
 
 ## Open decisions
 
-- **Why does greedy gemma-2b not say Paris here?** The one failing test, and
-  the only question the tiers below it cannot answer on their own. Settling it
-  means the llama.cpp oracle over `gemma-2b.gguf`, which means Google's gated
-  download — so the next move is either doing that download once by hand and
-  pointing `GEMMA_MODEL_DIR` at it, or finding an ungated F32 GGUF of the same
-  weights the fetch could take.
-- Does the BF16 read go into eacp now, so this project never carries a widened
-  fp32 path at all?
-- Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B? The
+- Settled: greedy gemma-2b does not say Paris, see step 4. What it leaves is
+  whether the GGUF conversion is worth wiring into the build — four lines in
+  `Model/CMakeLists.txt` to fetch the three tokenizer files the converter
+  wants, plus a Python with torch, which the build has no other reason to ask
+  for. For now it is a one-off by hand, recorded above.
+- The BF16 read went into eacp `develop`, and this project no longer widens
+  on the way to the device; the plain fetch has it.
+- Widen `Buffer` to 64-bit in an eacp change of its own, or defer until 7B? The
   logits buffer now hits the limit at a prompt capacity of 2048 rows, so it
   is a 2B question too, though one a smaller prefill block sidesteps.
