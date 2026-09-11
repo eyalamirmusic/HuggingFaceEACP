@@ -206,12 +206,14 @@ void Gemma::prepare(Device& device)
         std::min(promptRowCapacity, decoderShape.maxPositions);
     decoderShape.validate();
 
+    // The weights first, because the decoder compiles the product programs
+    // their storage needs and no others — see Decoder::prepare.
+    weights.emplace(*weightFile, decoderShape);
+
     decoder.emplace(decoderShape);
-    decoder->prepare(device);
+    decoder->prepare(device, *weights);
 
     selection.prepare(device, 1, decoderShape.logitElementCount());
-
-    weights.emplace(*weightFile, decoderShape);
 
     buildSuppressionMask();
 

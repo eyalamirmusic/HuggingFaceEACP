@@ -31,9 +31,10 @@ namespace HF
 // it is given and writes their logits, so the prompt a run opens with is one
 // call and each token after it is another.
 //
-// prepare() compiles every kernel, sizes every intermediate and every cache,
-// and uploads the rotary tables and the zero biases; the recording calls only
-// record. A step is one pass rather than one pass per dispatch: at a few
+// prepare() compiles every kernel a checkpoint's weights will be dispatched
+// through, sizes every intermediate and every cache, and uploads the rotary
+// tables and the zero biases; the recording calls only record. A step is one
+// pass rather than one pass per dispatch: at a few
 // microseconds of GPU each, ninety passes would be most of a step, and the KV
 // cache is read in the same pass that appended to it.
 //
@@ -48,12 +49,18 @@ namespace HF
 // One program of each kind serves every layer: the shapes are uniforms, so
 // eighteen layers of two norms, four projections and an attention are
 // re-bindings of a handful of pipelines rather than pipelines of their own. The
-// products are the exception, and are held six ways over three questions: a
-// float-weight program and a packed-half one, so a weight the loader left fp16
-// is dispatched through the program that reads fp16; the many-row tiled form a
-// prompt takes against the few-row split form a decode step takes; and, inside
-// that split form, the split count the shape wants — see stepSplitCount and
-// logitsSplitCount below.
+// products are the exception, and are declared nine ways over three questions:
+// the weight's storage, since a checkpoint may ship F32, fp16 or bf16 and
+// nothing about a GPU buffer says which; the many-row tiled form a prompt takes
+// against the few-row split form a decode step takes; and, inside that split
+// form, the split count the shape wants — see stepSplitCount and
+// logitsSplitCount below. The embedding gather is declared three ways for the
+// first of those reasons alone.
+//
+// **Only one storage's worth is built.** A checkpoint is in one storage, so
+// prepare() takes the weights and compiles the four programs they name; the
+// other eight stay empty optionals. Compiling all twelve built two whole
+// SIMD-group matrix pipelines that nothing would ever dispatch.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -63,8 +70,22 @@ class Decoder
 public:
     explicit Decoder(const DecoderShape& shapeToUse);
 
-    void prepare(eacp::GPU::Device& device);
-    void prepare();
+    // Compiles the kernels, sizes every intermediate and every cache, and
+    // uploads the rotary tables and the zero biases.
+    //
+    // **The weights are an argument because the products are not one program.**
+    // Each of them is held per WeightStorage, and a checkpoint is in one — so
+    // compiling all three would build two whole SIMD-group matrix pipelines and
+    // two gathers a run never dispatches. What is compiled is
+    // weights.storages() and nothing else, and a step against weights in a
+    // storage this was not prepared for is a ModelError thrown before anything
+    // is recorded.
+    //
+    // Only the storages are read here, not the shape: a decoder may be prepared
+    // against one set of weights and stepped against another of the same
+    // storage, and step() is where a shape that disagrees is refused.
+    void prepare(eacp::GPU::Device& device, const DecoderWeights& weights);
+    void prepare(const DecoderWeights& weights);
 
     const DecoderShape& shape() const { return decoderShape; }
 
@@ -153,6 +174,19 @@ private:
     void requireMatchingWeights(const DecoderWeights& weights) const;
     void requirePrepared() const;
 
+    // Whether the four programs a storage needs were built, and the refusal
+    // step() raises when a checkpoint's are not. Both are asked before a step
+    // records anything, so a dispatch below can dereference its optional.
+    bool isPrepared(WeightStorage storage) const;
+    void requirePreparedStorages(const DecoderWeights& weights) const;
+
+    void prepareStorage(eacp::GPU::Device& device, WeightStorage storage);
+
+    void encodeEmbed(eacp::GPU::ComputePass& pass,
+                     const eacp::GPU::BufferRange& tokens,
+                     const TensorBuffer& table,
+                     int tokenCount);
+
     void encodeLayer(eacp::GPU::ComputePass& pass,
                      const DecoderLayerWeights& weights,
                      int layerIndex,
@@ -198,18 +232,30 @@ private:
     DecoderShape decoderShape;
     int decodedPositions = 0;
 
-    Embed embedding;
     RMSNorm normalisation {normLanes};
-    LinearProduct product;
-    HalfWeightLinearProduct packedProduct;
-    SplitLinear splitProjection {stepSplitCount};
-    HalfWeightSplitLinear packedSplitProjection {stepSplitCount};
-    SplitLinear splitLogits {logitsSplitCount};
-    HalfWeightSplitLinear packedSplitLogits {logitsSplitCount};
     RoPE rotation;
     GeGLU gating;
     MultiQueryPrefillAttention prefillAttention;
     MultiQueryDecodeAttention decodeAttention;
+
+    // The four programs a weight storage needs — the gather, the many-row tiled
+    // product, and the split product at each of the two split counts — held
+    // empty until prepare() is given a checkpoint that asks for them. A run
+    // builds one row of this and leaves the other eight pipelines uncompiled.
+    std::optional<Embed> embedding;
+    std::optional<LinearProduct> product;
+    std::optional<SplitLinear> splitProjection;
+    std::optional<SplitLinear> splitLogits;
+
+    std::optional<HalfWeightEmbed> halfEmbedding;
+    std::optional<HalfWeightLinearProduct> halfProduct;
+    std::optional<HalfWeightSplitLinear> halfSplitProjection;
+    std::optional<HalfWeightSplitLinear> halfSplitLogits;
+
+    std::optional<BFloat16WeightEmbed> bfloatEmbedding;
+    std::optional<BFloat16WeightLinearProduct> bfloatProduct;
+    std::optional<BFloat16WeightSplitLinear> bfloatSplitProjection;
+    std::optional<BFloat16WeightSplitLinear> bfloatSplitLogits;
 
     // The residual stream, which two sublayers add to in place from their last
     // product's store: a layer enters and leaves in hidden, so the next layer

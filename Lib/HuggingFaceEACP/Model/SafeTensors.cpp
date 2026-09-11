@@ -62,7 +62,8 @@ float halfToFloat(std::uint16_t bits)
 
 // bfloat16 is the top half of a float32, so widening is a shift and nothing
 // else: exact for every pattern, subnormals, zeros, infinities and NaNs alike,
-// and identical to what plan.md's readBFloat16 would do in a shader.
+// and identical bit for bit to what eacp's readBFloat16 does in a shader, which
+// is what lets a reference on the CPU check the packed path's arithmetic.
 float bfloatToFloat(std::uint16_t bits)
 {
     return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
@@ -227,12 +228,12 @@ eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
         raw.data(), raw.size(), eacp::GPU::BufferUsage::Storage);
 }
 
-// A buffer of halves is read one 32-bit word at a time — readHalf(i) fetches
-// word i / 2 and picks a side of it — so an odd count of halves needs a
-// padding half rather than a read one element past the allocation. An even
-// count, which is every weight matrix of an even width, still goes up
-// untouched.
-eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
+// A buffer of sixteen-bit floats is read one 32-bit word at a time —
+// readHalf(i) and readBFloat16(i) fetch word i / 2 and pick a side of it — so
+// an odd element count needs a padding element rather than a read one past the
+// allocation. An even count, which is every weight matrix of an even width,
+// still goes up untouched.
+eacp::GPU::Buffer uploadPackedPairs(Span<const std::uint8_t> raw)
 {
     constexpr auto wordBytes = 4;
     const auto remainder = raw.size() % wordBytes;
@@ -471,18 +472,37 @@ TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
 
     // Already a layout a kernel binds, so these go straight from the blob
     // rather than through a widened copy of themselves: F32 as the floats a
-    // subscript reads, F16 as the packed halves readHalf reads.
+    // subscript reads, F16 and BF16 as the packed pairs readHalf and
+    // readBFloat16 read. Gemma's own weights are BF16, so this is what halves
+    // what the device holds against the widened path this used to take.
     if (tensor.type == TensorType::F32)
         return {uploadBytes(rawBytes(tensor)), tensor.type};
 
-    if (tensor.type == TensorType::F16)
-        return {uploadPackedHalves(rawBytes(tensor)), tensor.type};
+    if (isPackedSixteenBit(tensor.type))
+        return {uploadPackedPairs(rawBytes(tensor)), tensor.type};
 
-    // BF16 and F64 have no shader read of their own, so the conversion has to
-    // happen somewhere and doing it once here beats doing it in every kernel.
-    // For Gemma that is every weight in the model, at twice the bytes on the
-    // device — plan.md's first eacp gap, and the reason it is ranked first.
-    const auto values = readFloats(name);
+    // F64 and the integer types have no shader read of their own, so the
+    // conversion has to happen somewhere and doing it once here beats doing it
+    // in every kernel.
+    return widenedBuffer(tensor);
+}
+
+TensorBuffer SafeTensors::makeFloatBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    if (tensor.type == TensorType::F32)
+        return {uploadBytes(rawBytes(tensor)), TensorType::F32};
+
+    return widenedBuffer(tensor);
+}
+
+TensorBuffer SafeTensors::widenedBuffer(const TensorInfo& tensor) const
+{
+    auto values = Vector<float> {};
+    values.resize(static_cast<int>(tensor.elementCount()));
+    widenToFloat(tensor, rawBytes(tensor), values);
+
     const auto byteCount = static_cast<std::int64_t>(values.size())
                            * static_cast<std::int64_t>(sizeof(float));
 

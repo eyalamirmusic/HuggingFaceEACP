@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "TiledProduct.h"
 
 using namespace nano;
 using namespace HF;
@@ -78,6 +79,52 @@ auto tMatMulMatchesCpu = test("Kernels/matMulMatchesCpu") = []
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
+};
+
+// The two packed variants of the same product, over weights narrowed by the
+// host packer so the reference sees exactly what the shader widens back. An odd
+// element count in both, so the last element's thread reads the half of a word
+// the padding completes.
+auto tPackedWeightMatMulMatchesCpu =
+    test("Kernels/packedWeightMatMulMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    auto a = spreadValues(rowCount * innerCount, 313131u, 2.f);
+    auto bias = spreadValues(columnCount, 484848u, 1.f);
+    auto values = spreadValues(innerCount * columnCount, 595959u, 3.f);
+
+    auto checkPacked = [&](auto& kernel, TiledProduct::WeightPacker pack)
+    {
+        auto widened = Vector<float> {};
+        auto packed = pack(values, widened);
+
+        auto aBuffer = storageOf(a);
+        auto bBuffer = storageOf(packed);
+        auto biasBuffer = storageOf(bias);
+        auto output = outputFor(rowCount * columnCount);
+
+        kernel.a = aBuffer;
+        kernel.b = bBuffer;
+        kernel.bias = biasBuffer;
+        kernel.output = output;
+        kernel.innerCount = (unsigned) innerCount;
+        kernel.columnCount = (unsigned) columnCount;
+
+        auto result = runOverGrid(kernel, output, columnCount, rowCount);
+        auto expected =
+            matMulReference(a, widened, bias, rowCount, innerCount, columnCount);
+
+        for (auto i = 0; i < result.size(); ++i)
+            check(isClose(result[i], expected[i], 1e-5));
+    };
+
+    auto half = HalfWeightMatMul {};
+    auto bfloat = BFloat16WeightMatMul {};
+
+    checkPacked(half, TiledProduct::packedHalves);
+    checkPacked(bfloat, TiledProduct::packedBFloat16s);
 };
 
 // A shape wide enough that a thread reaching one element past its row, or an

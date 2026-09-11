@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "TiledProduct.h"
 
 using namespace nano;
 using namespace HF;
@@ -161,6 +162,49 @@ auto tEmbedReadsWholeVocabularyExactly =
         for (auto column = 0; column < width; ++column)
             check(result[step * width + column]
                   == (float) tokens[step] + 0.25f * (float) column);
+};
+
+// The packed table, which is what the tied embedding is once the checkpoint's
+// bf16 rows go up as they lie: the gather has to widen exactly what the logits
+// product widens, since the two read the same buffer. The reference runs on the
+// narrowed values, so what this asserts is the gather's indexing — a row picked
+// out of a buffer whose elements are half the width its index counts in.
+//
+// An odd model width, so a row starts in the high half of a word as often as in
+// the low one and a gather that assumed rows begin on word boundaries fails.
+auto tBFloat16WeightEmbedMatchesCpu =
+    test("Kernels/bfloat16WeightEmbedMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto width = 5;
+    constexpr auto smallVocabulary = 13;
+
+    auto tokens = tokensOf({7, 0, 12, 3, 3, 11});
+    auto values = spreadValues(smallVocabulary * width, 4242u, 2.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
+
+    auto tokenBuffer = storageOf(tokens);
+    auto tableBuffer = storageOf(packed);
+    auto output = outputFor(tokens.size() * width);
+
+    auto kernel = BFloat16WeightEmbed {};
+    kernel.tokens = tokenBuffer;
+    kernel.tokenTable = tableBuffer;
+    kernel.output = output;
+    kernel.width = (unsigned) width;
+    kernel.scale = gemmaScale;
+
+    auto result = runOverGrid(kernel, output, width, tokens.size());
+    auto expected = embedReference(tokens, widened, width, gemmaScale);
+
+    check(result.size() == expected.size());
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-6));
 };
 
 // The shape a decode step has: one token, the model's own width, through the

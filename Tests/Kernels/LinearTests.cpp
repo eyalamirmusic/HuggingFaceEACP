@@ -297,6 +297,47 @@ auto tHalfWeightLinearMatchesCpu = test("Kernels/halfWeightLinearMatchesCpu") = 
         check(isClose(result[i], expected[i], 1e-5));
 };
 
+// The bf16 variant, which is what Gemma's own projections are read through. The
+// weights are narrowed by eacp's host packer and the reference runs on what
+// that leaves, so the disagreement under test is the shader's widening and not
+// the format's precision. An odd element count again, for the padding half.
+auto tBFloat16WeightLinearMatchesCpu =
+    test("Kernels/bfloat16WeightLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 7;
+    constexpr auto outputs = 3;
+    constexpr auto rows = 5;
+
+    auto input = spreadValues(rows * inner, 424242u, 2.f);
+    auto bias = spreadValues(outputs, 242424u, 1.f);
+    auto values = spreadValues(outputs * inner, 909090u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = BFloat16WeightLinear {};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+
+    auto result = runOverGrid(kernel, output, outputs, rows);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
+};
+
 namespace
 {
 // SplitLinear's own runner: it decides its grid from the shape, so this
@@ -479,4 +520,63 @@ auto tHalfWeightSplitLinearMatchesCpu =
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
+};
+
+namespace
+{
+void checkBFloat16SplitLinear(int splitCount, int rows, int inner, int outputs)
+{
+    auto input = spreadValues(rows * inner, 515151u, 2.f);
+    auto bias = spreadValues(outputs, 626262u, 1.f);
+    auto values = spreadValues(outputs * inner, 737373u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = BFloat16WeightSplitLinear {splitCount};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+    kernel.rowCount = (unsigned) rows;
+    kernel.gelu = 0u;
+    kernel.residual = 0u;
+
+    auto result = runSplitLinear(kernel, output, outputs, rows);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
+
+    const auto tolerance = TiledProduct::dotProductTolerance(inner);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], tolerance));
+}
+} // namespace
+
+// The bf16 split form, which is the product a decode step spends nearly all its
+// bandwidth in — every projection and the logits row against the tied
+// embedding. Both of the kernel's inner loops are covered: an inner extent
+// divisible by four takes the four-wide read, which for bf16 is two words, and
+// one that is not takes the element-at-a-time read.
+//
+// The model's own decode shape is in here too — one row, 2048 in — since that
+// is the only place the four-wide bf16 read is on the hot path.
+auto tBFloat16WeightSplitLinearMatchesCpu =
+    test("Kernels/bfloat16WeightSplitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto splits: {8, 32, 64, 96})
+    {
+        checkBFloat16SplitLinear(splits, 2, 8, 5);
+        checkBFloat16SplitLinear(splits, 5, 7, 3);
+        checkBFloat16SplitLinear(splits, 1, 2048, 384);
+    }
 };

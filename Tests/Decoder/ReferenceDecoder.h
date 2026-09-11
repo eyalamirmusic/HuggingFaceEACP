@@ -361,7 +361,7 @@ public:
         , weights(file, shapeToUse)
         , decoder(shapeToUse)
     {
-        decoder.prepare(eacp::GPU::Device::shared());
+        decoder.prepare(eacp::GPU::Device::shared(), weights);
     }
 
     StepResult step(const std::vector<int>& tokens)

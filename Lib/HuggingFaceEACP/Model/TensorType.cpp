@@ -61,6 +61,11 @@ std::string_view tensorTypeName(TensorType type)
     return entryFor(type).name;
 }
 
+bool isPackedSixteenBit(TensorType type)
+{
+    return type == TensorType::F16 || type == TensorType::BF16;
+}
+
 std::optional<TensorType> findTensorType(std::string_view name)
 {
     for (const auto& entry: tensorTypes)

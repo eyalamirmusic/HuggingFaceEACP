@@ -372,13 +372,7 @@ struct SimdTiledMatMulProgram final : ComputeProgram
             return staging[index];
     }
 
-    Float weight(const UInt& index)
-    {
-        if constexpr (bStorage == WeightStorage::PackedHalf)
-            return b.readHalf(index);
-        else
-            return b[index];
-    }
+    Float weight(const UInt& index) { return storedWeight<bStorage>(b, index); }
 
     // TiledMatMulProgram's reason for writing this out rather than declaring
     // it with EACP_SHADER: the maxima bindings belong to one instantiation
@@ -446,6 +440,9 @@ using SimdTiledLinear =
     SimdTiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Float>;
 using HalfWeightSimdTiledLinear =
     SimdTiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
+using BFloat16WeightSimdTiledLinear =
+    SimdTiledMatMulProgram<OperandLayout::ContiguousK,
+                           WeightStorage::PackedBFloat16>;
 using SimdTiledMatMul =
     SimdTiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxSimdTiledMatMul = SimdTiledMatMulProgram<OperandLayout::ContiguousN,
@@ -466,16 +463,24 @@ using MaximaSimdTiledLinear = SimdTiledMatMulProgram<OperandLayout::ContiguousK,
 // is what every other backend gets, and what a role goes back to if it ever
 // measures no better on it.
 #if defined(__APPLE__)
-using LinearProduct = SimdTiledLinear;
-using HalfWeightLinearProduct = HalfWeightSimdTiledLinear;
+template <WeightStorage storage>
+using LinearProductFor = SimdTiledMatMulProgram<OperandLayout::ContiguousK, storage>;
+
 using AttentionScoresProduct = MaximaSimdTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxSimdTiledMatMul;
 #else
-using LinearProduct = TiledLinear;
-using HalfWeightLinearProduct = HalfWeightTiledLinear;
+template <WeightStorage storage>
+using LinearProductFor = TiledMatMulProgram<OperandLayout::ContiguousK, storage>;
+
 using AttentionScoresProduct = MaximaTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxTiledMatMul;
 #endif
+
+// The three storages a checkpoint's projection weights may arrive in, each
+// through whichever of the two programs above this backend took.
+using LinearProduct = LinearProductFor<WeightStorage::Float>;
+using HalfWeightLinearProduct = LinearProductFor<WeightStorage::PackedHalf>;
+using BFloat16WeightLinearProduct = LinearProductFor<WeightStorage::PackedBFloat16>;
 
 // The scores product reports its maxima in its own tiling and the apply folds
 // them in the apply's, so the two roles have to be tiled the same way. They

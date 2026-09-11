@@ -53,13 +53,14 @@ namespace HF
 // top-p onto the device is a later round; the tokens are the same either way,
 // which is what the tests over the two paths say.
 //
-// **Memory.** Gemma's weights are BF16 and arrive widened to F32 — plan.md's
-// first gap — so the device holds about 10 GB of them, with the 2.1 GB
-// embedding bound twice: once as the gather's table and once as the tied logits
-// projection. On top of that the logits buffer is promptCapacity() rows of the
-// vocabulary, 524 MB at the default 512 rows, and it is the one buffer here
-// that scales with that setting. The 128 GB machine this is developed on takes
-// it; plan.md's first two gaps are what change it.
+// **Memory.** Gemma's weights are BF16 and stay BF16: every product and the
+// embedding gather read them through eacp's readBFloat16, so the device holds
+// about 5 GB of them rather than the 10 GB a widened copy cost, with the
+// 1.05 GB embedding bound twice — once as the gather's table and once as the
+// tied logits projection. On top of that the logits buffer is promptCapacity()
+// rows of the vocabulary, 524 MB at the default 512 rows, and it is now the
+// largest single allocation here after the embedding, as well as the one buffer
+// that scales with that setting.
 class Gemma
 {
 public:

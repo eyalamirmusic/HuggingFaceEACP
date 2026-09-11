@@ -65,7 +65,7 @@ struct RMSNorm final : ReducingProgram
                  summing += lanes;
              });
 
-        auto scale = var(rsqrt(groupSum(squares.get()) / width + epsilon));
+        auto scale = var(rsqrt(foldSum(squares.get()) / width + epsilon));
         auto writing = var(lane);
 
         loop(writing.get() < rowLength,

@@ -1,9 +1,8 @@
 #pragma once
 
 #include "Gelu.h"
-#include "KernelTypes.h"
 #include "Masking.h"
-#include "MatMul.h"
+#include "WeightStorage.h"
 
 #include <cstdint>
 
@@ -517,13 +516,7 @@ struct TiledMatMulProgram final : ComputeProgram
         }
     }
 
-    Float weight(const UInt& index)
-    {
-        if constexpr (bStorage == WeightStorage::PackedHalf)
-            return b.readHalf(index);
-        else
-            return b[index];
-    }
+    Float weight(const UInt& index) { return storedWeight<bStorage>(b, index); }
 
     // Written out rather than declared by EACP_SHADER because the maxima
     // bindings belong to one instantiation each: a program that does not read
@@ -594,6 +587,8 @@ using TiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Float>;
 using HalfWeightTiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
+using BFloat16WeightTiledLinear =
+    TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedBFloat16>;
 using TiledMatMul =
     TiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxTiledMatMul = TiledMatMulProgram<OperandLayout::ContiguousN,

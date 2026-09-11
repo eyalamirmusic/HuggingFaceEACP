@@ -39,3 +39,4 @@
 #include "SimdTiledMatMul.h"
 #include "Softmax.h"
 #include "TiledMatMul.h"
+#include "WeightStorage.h"

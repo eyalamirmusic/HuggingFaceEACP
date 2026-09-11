@@ -108,13 +108,28 @@ protected:
     // arrangement — a lane per key, each carrying a head-wide row of
     // accumulators for the group to fold at the end — is what WhisperEACP's
     // SingleQueryAttention does, and at a head width of 256 it asks for
-    // 64 lanes * 256 floats = 64 kB of threadgroup memory against Metal's
-    // 32 kB, which plan.md records as the constraint this kernel is written
-    // around. Here the group keeps **one** head-wide accumulator and each lane
-    // owns the columns lane, lane + 64, ... of it: 256 floats whatever the lane
-    // count is, no lane ever touches another's column, and the fold needs no
+    // 64 lanes * 256 floats, which is past what any backend allows.
+    //
+    // That is a number to measure rather than one to write down.
+    // `threadgroupMemoryBytes()` is what this kernel declares and
+    // `Device::maxThreadgroupMemory()` is what the device gives;
+    // MultiQueryAttentionTests asserts both, and asserts the rejected layout
+    // against the second of them rather than against a constant.
+    //
+    // Here the group keeps **one** head-wide accumulator and each lane owns the
+    // columns lane, lane + 64, ... of it: 256 floats whatever the lane count
+    // is, no lane ever touches another's column, and the fold needs no
     // cross-lane reduction at all. Adjacent lanes read adjacent columns of the
     // same value row, which is the access the memory system serves whole.
+    //
+    // **The lane count stays the stock 64, and that was measured.** The two
+    // folds per tile are whole-group ones, so a group of 32 would be a single
+    // SIMD group and both could be simdMax/simdSum — no scratch and no barrier,
+    // which is what plan.md recorded as the gap. Run that way the decoder is
+    // *slower*: 76.6 tokens/s against 83.4 over 64 decode steps, because
+    // halving the lanes doubles the tiles and halves the threads walking the
+    // head width, and a step that is already at memory bandwidth has no barrier
+    // cost left to save.
     //
     // The accumulator sits in threadgroup memory rather than in registers only
     // because the head width is a uniform: how many columns a lane owns is not

@@ -100,6 +100,11 @@ TensorBuffer ShardedTensors::makeBuffer(std::string_view name) const
     return shardFor(name).makeBuffer(name);
 }
 
+TensorBuffer ShardedTensors::makeFloatBuffer(std::string_view name) const
+{
+    return shardFor(name).makeFloatBuffer(name);
+}
+
 const SafeTensors& ShardedTensors::shardHolding(std::string_view name) const
 {
     return shardFor(name);

@@ -45,6 +45,21 @@ auto tTiledLinearPackedWeights = test("Kernels/tiledLinearPackedWeights") = []
     TiledProduct::checkPackedLinear<HalfWeightTiledLinear>(37, 21, 35, 400u);
 };
 
+// The bf16 form, which is the one Gemma's own weights are read through on a
+// backend with no SIMD-group matrix. Same reference, weights narrowed through
+// eacp's host packer first so it sees what the shader widens back.
+auto tTiledLinearBFloat16Weights = test("Kernels/tiledLinearBFloat16Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedLinear<BFloat16WeightTiledLinear>(
+        37, 21, 35, 400u, TiledProduct::packedBFloat16s);
+
+    TiledProduct::checkPackedLinear<BFloat16WeightTiledLinear>(
+        70, 50, 45, 410u, TiledProduct::packedBFloat16s);
+};
+
 // Attention scores as a decoder computes them — 35 queries over three heads
 // against a cache of 39 keys, scaled and causally masked over the trapezoid
 // that leaves, where query 0 stands at position 4.

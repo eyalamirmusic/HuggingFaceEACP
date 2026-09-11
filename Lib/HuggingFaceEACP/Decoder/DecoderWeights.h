@@ -5,6 +5,12 @@
 
 namespace HF
 {
+// Which of the three product programs a buffer is readable by. The loader
+// decided it when it uploaded the tensor, and nothing about a GPU::Buffer
+// carries it, which is why TensorBuffer holds the buffer and its storage
+// together.
+WeightStorage weightStorageOf(const TensorBuffer& weight);
+
 // One decoder block's tensors, under the names google/gemma-2b ships them —
 // model.layers.<index>.self_attn.q_proj.weight and the rest, spelled once in
 // Model/GemmaTensors.h so that nothing here is a convention that could drift
@@ -25,20 +31,17 @@ namespace HF
 // fifth step goes one further and folds the multiply into the down product's
 // operand read; this is the shape that step starts from.
 //
-// **Storage.** Gemma's own weights are BF16, which has no shader read yet —
-// plan.md's first gap — so SafeTensors widens them and every tensor here
-// arrives F32. A converted repo may ship fp16, and a projection weight is the
-// one operand that may stay packed: the product kernels have a half-reading
-// variant and the Decoder picks it by TensorBuffer::storage. The norm scales
-// and the embedding are bound to programs with no packed read at all, so a
-// packed one there would be wrong by a factor of two in every index while
-// staying silent, and loadFloatTensor refuses it.
+// **Storage.** Every weight a product kernel reads arrives as the checkpoint
+// ships it, packed or not: Gemma's own are BF16, a converted repo's may be
+// fp16, and the product kernels have a variant per storage that the Decoder
+// picks by TensorBuffer::storage. That includes the fused gate-and-up weight,
+// which is stacked as raw bytes rather than concatenated through readFloats, so
+// a packed pair stays packed — see TensorLoader::loadStackedProjectionWeights.
 //
-// The fused gate-and-up weight is the exception on both counts: the
-// concatenation happens on the CPU through readFloats, so a packed pair is
-// widened on the way in rather than stacked packed. That costs an fp16 repo a
-// second copy of the largest weight in the layer, and costs Gemma's own BF16
-// checkpoint nothing at all, since every tensor in it is widened anyway.
+// **The two norm scales are the exception, and are widened to F32.** They are
+// [width] each, 8 kB a layer, and the alternative is a packed read in RMSNorm
+// for a tensor whose bytes are a rounding error against the projections beside
+// it. loadFloatTensor is what widens them.
 struct DecoderLayerWeights
 {
     DecoderLayerWeights(const ShardedTensors& file,
@@ -67,14 +70,26 @@ struct DecoderLayerWeights
 // that shipped an untied head would be a different architecture rather than a
 // variant of this one.
 //
-// embed_tokens is therefore the tensor bound twice, and it decides its own
-// case. The gather subscripts it as floats and has no packed form; the logits
-// projection could read it either way. One buffer cannot be both, so **the
-// embedding must be F32** and a packed one is a ModelError naming it — which
-// keeps the tie between the two exact rather than exact up to a conversion.
+// embed_tokens is therefore the tensor bound twice, and both readers take it in
+// whatever the checkpoint stored: EmbedProgram and the products are each
+// parameterised by WeightStorage, and both widen a packed element through the
+// same call. At Gemma's [256000, 2048] that is 1.05 GB bound twice rather than
+// 2.10 GB — the largest single saving the packed path makes, and what kept the
+// gather from forcing the whole embedding to be widened for the sake of one
+// subscript.
 struct DecoderWeights
 {
     DecoderWeights(const ShardedTensors& file, const DecoderShape& shapeToUse);
+
+    // Every distinct storage the weights above a product or the gather reads
+    // are in, which for a real checkpoint is one entry. Decoder::prepare
+    // compiles the programs these name and no others — three storages times a
+    // tiled product, two split products and a gather is twelve pipelines, of
+    // which a run dispatches four.
+    //
+    // The norm scales are not in here. They are widened to F32 on the way up
+    // and bound to RMSNorm, which has no storage to pick.
+    Vector<WeightStorage> storages() const;
 
     DecoderShape shape;
 

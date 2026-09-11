@@ -125,6 +125,34 @@ inline Vector<float> packedHalves(const Vector<float>& values,
     return words;
 }
 
+// bfloat16s the same way, through eacp's own host converter rather than a
+// cast: bf16 is not a type either compiler has, and bfloat16FromFloat is the
+// encoding readBFloat16 widens back, rounding included.
+inline Vector<float> packedBFloat16s(const Vector<float>& values,
+                                     Vector<float>& widened)
+{
+    auto words = zeroes((values.size() + 1) / 2);
+    widened = sized(values.size());
+
+    for (auto i = 0; i < values.size(); ++i)
+    {
+        const auto bits = eacp::GPU::bfloat16FromFloat(values[i]);
+        widened[i] = eacp::GPU::bfloat16ToFloat(bits);
+
+        auto word = std::uint32_t {};
+        std::memcpy(&word, &words[i / 2], sizeof(word));
+        word |= (std::uint32_t) bits << (16 * (i % 2));
+        std::memcpy(&words[i / 2], &word, sizeof(word));
+    }
+
+    return words;
+}
+
+// Which of the two packings a check narrows its weights through, so one check
+// serves both packed forms of a program: the words it returns are the buffer
+// the kernel reads, and what it leaves in `widened` is what the reference sees.
+using WeightPacker = Vector<float> (*)(const Vector<float>&, Vector<float>&);
+
 // What every check below asks of a product whose inner extent is a few dozen
 // terms. Long sums want more — see dotProductTolerance.
 inline constexpr auto shortSumTolerance = 1e-5;
@@ -170,7 +198,11 @@ void checkLinear(int rows,
 }
 
 template <typename Program>
-void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
+void checkPackedLinear(int rows,
+                       int inner,
+                       int columns,
+                       unsigned seed,
+                       WeightPacker pack = packedHalves)
 {
     auto shape = TiledMatMulShape::forLinear(rows, inner, columns);
     auto a = spreadValues(rows * inner, seed, 2.f);
@@ -178,7 +210,7 @@ void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
     auto bias = spreadValues(columns, seed + 2u, 1.f);
 
     auto widened = Vector<float> {};
-    auto packed = packedHalves(weights, widened);
+    auto packed = pack(weights, widened);
 
     auto kernel = Program {};
     auto result = run(kernel, a, storageOf(packed), bias, shape, rows * columns);

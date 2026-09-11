@@ -93,6 +93,27 @@ auto tSimdTiledLinearPackedWeights =
     TiledProduct::checkPackedLinear<HalfWeightSimdTiledLinear>(100, 45, 76, 410u);
 };
 
+// The bf16 form of the same product, which is what Gemma's own weights are read
+// through: the checkpoint is narrowed by eacp's host packer and the reference
+// runs on what that leaves, so the two agree to float32 accumulation rather
+// than to bf16's three digits. The odd inner extent puts a weight row's last
+// element in the high half of a word and the next row's first in a new one.
+auto tSimdTiledLinearBFloat16Weights =
+    test("Kernels/simdTiledLinearBFloat16Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        37, 21, 35, 400u, TiledProduct::packedBFloat16s);
+
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        100, 45, 76, 410u, TiledProduct::packedBFloat16s);
+
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        128, 64, 128, 420u, TiledProduct::packedBFloat16s);
+};
+
 // The batch fold and the causal mask together: one batch per head over the
 // head's slice of rows the batch strides address, and a trapezoid whose masked
 // count is asserted rather than only its values.

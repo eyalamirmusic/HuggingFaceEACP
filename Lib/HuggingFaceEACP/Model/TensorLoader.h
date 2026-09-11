@@ -23,12 +23,12 @@ using TensorShape = std::initializer_list<int>;
 // "layer 3" — so a refusal says which part of the model would not take the
 // checkpoint rather than leaving that to a stack trace.
 //
-// **Packed storage.** A projection weight may stay packed as fp16: the product
-// kernels have a half-reading variant and the caller picks it by
-// TensorBuffer::storage. Every other tensor is bound to a program with no half
-// read, so a packed one there would be wrong by a factor of two in every index
-// while staying silent, and loadFloatTensor refuses it. Gemma's own weights
-// are BF16, which has no shader read at all yet and therefore arrives widened.
+// **Packed storage.** A weight a product kernel reads may stay as the
+// checkpoint ships it — F32, fp16 or bf16 — since every product has a variant
+// per storage and the caller picks it by TensorBuffer::storage. Everything else
+// is bound to a program that only subscripts floats, and loadFloatTensor is
+// what widens those on the way up: a packed buffer there would be read at half
+// the stride it was written at, silently, on both backends.
 struct TensorLoader
 {
     const ShardedTensors& file;
@@ -39,19 +39,35 @@ struct TensorLoader
     void checkShape(const TensorInfo& tensor, Span<const int> expected) const;
     void checkShape(const TensorInfo& tensor, TensorShape expected) const;
 
-    void rejectPackedHalf(const TensorBuffer& loaded,
-                          const std::string& name,
-                          std::string_view reader) const;
-
-    // Bound to a program that subscripts a float buffer, so a packed one would
-    // be read at half the stride it was written at — silently, on both
-    // backends. `reader` is the kernel the refusal names.
+    // Widened to F32 whatever the checkpoint stores it as, for the programs
+    // that subscript a float buffer.
     TensorBuffer loadFloatTensor(const std::string& name,
-                                 TensorShape expected,
-                                 std::string_view reader) const;
+                                 TensorShape expected) const;
 
-    // A projection weight, which is the one operand that may stay packed.
+    // A weight a product kernel reads, which is the one that may stay packed.
     TensorBuffer loadProjectionWeight(const std::string& name,
                                       TensorShape expected) const;
+
+    // Two weights of one shape as a single buffer, the first's rows then the
+    // second's — the concatenation Gemma's fused gate-and-up weight is. Both
+    // are checked at their shipped shapes before a byte is read, so a
+    // checkpoint whose halves disagree is a ModelError naming the tensor rather
+    // than a stack of two matrices of different widths.
+    //
+    // **The bytes are stacked, not the values.** A packed pair goes up still
+    // packed, at the storage both halves share, so a bf16 or fp16 repo pays one
+    // copy of its largest weight rather than a widened one — which is what the
+    // "no raw-bytes concatenation" item in plan.md asked for. What stops it is
+    // an odd element count in either half, since a packed read fetches whole
+    // words; that falls back to widening both, as does a pair whose halves are
+    // stored differently or in a type no kernel reads.
+    //
+    // The stack is the one buffer here that is twice a tensor's size, so it is
+    // also where a GPU buffer's int-sized byte count is reachable — plan.md's
+    // second gap. It is counted in 64 bits and refused by name rather than
+    // truncated.
+    TensorBuffer loadStackedProjectionWeights(const std::string& first,
+                                              const std::string& second,
+                                              TensorShape expected) const;
 };
 } // namespace HF

@@ -71,9 +71,9 @@ protected:
     // is that nothing was chosen.
     Candidate foldCandidates(const Float& value, const UInt& index)
     {
-        auto best = groupMax(value);
+        auto best = foldMax(value);
 
-        return {best, groupMin(select(value == best, index, unchosenIndex))};
+        return {best, foldMin(select(value == best, index, unchosenIndex))};
     }
 };
 

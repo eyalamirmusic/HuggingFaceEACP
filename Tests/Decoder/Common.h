@@ -62,24 +62,27 @@ inline DecoderShape smallDecoderShape()
 // ---------------------------------------------------------------------------
 
 // One tensor before it is written: the name the checkpoint gives it, the shape
-// its header will claim, and the floats its blob will hold.
+// its header will claim, the floats its blob will hold, and what the blob
+// stores them as. F32 by default and BF16 for the checkpoints written the way
+// google/gemma-2b itself ships — see asBFloat16 below.
 struct SyntheticTensor
 {
     std::string name;
     Vector<int> shape;
     Vector<float> values;
+    TensorType type = TensorType::F32;
 };
 
-// A safetensors file assembled in memory out of F32 tensors — eight bytes of
-// header length, the JSON naming each tensor's dtype, shape and byte range,
-// then the blob those ranges are relative to.
+// A safetensors file assembled in memory — eight bytes of header length, the
+// JSON naming each tensor's dtype, shape and byte range, then the blob those
+// ranges are relative to.
 class TensorFileWriter
 {
 public:
     void add(const SyntheticTensor& tensor)
     {
         const auto begin = (std::uint64_t) blob.size();
-        appendFloats(tensor.values);
+        appendValues(tensor);
 
         if (!header.empty())
             header += ",";
@@ -104,9 +107,30 @@ private:
                                  std::uint64_t begin,
                                  std::uint64_t end)
     {
-        return "\"" + tensor.name + "\":{\"dtype\":\"F32\",\"shape\":"
-               + shapeText(tensor.shape) + ",\"data_offsets\":["
+        return "\"" + tensor.name + "\":{\"dtype\":\""
+               + std::string {tensorTypeName(tensor.type)}
+               + "\",\"shape\":" + shapeText(tensor.shape) + ",\"data_offsets\":["
                + std::to_string(begin) + "," + std::to_string(end) + "]}";
+    }
+
+    void appendValues(const SyntheticTensor& tensor)
+    {
+        if (tensor.type != TensorType::BF16)
+        {
+            appendFloats(tensor.values);
+            return;
+        }
+
+        // Little-endian, which is what the reader asserts the format is, and
+        // through eacp's own converter so the rounding is the one a shader
+        // reading this back would widen.
+        for (auto value: tensor.values)
+        {
+            const auto bits = eacp::GPU::bfloat16FromFloat(value);
+
+            blob.add((std::uint8_t) (bits & 0xFFu));
+            blob.add((std::uint8_t) (bits >> 8));
+        }
     }
 
     void appendFloats(const Vector<float>& values)
@@ -230,6 +254,39 @@ enum class Sharding
 // shape the config does not imply. The default edits nothing, so the ordinary
 // case names no callback at all.
 using TensorEdit = std::function<void(Vector<SyntheticTensor>&)>;
+
+// Every tensor written as BF16, which is what google/gemma-2b itself ships and
+// what the loader now uploads still packed. The values are narrowed on the way
+// into the blob, so readFloats hands the reference exactly the numbers
+// readBFloat16 hands the GPU and the two are compared on equal terms.
+inline TensorEdit asBFloat16()
+{
+    return [](Vector<SyntheticTensor>& tensors)
+    {
+        for (auto& tensor: tensors)
+            tensor.type = TensorType::BF16;
+    };
+}
+
+// A packed bf16 buffer read back as the values a shader widens it to, for a
+// test that has to look at what was uploaded rather than at what came out of a
+// kernel. The buffer's elements are words holding two, low half first.
+inline Vector<float> readBackBFloat16(const eacp::GPU::Buffer& buffer, int count)
+{
+    const auto words = readBack(buffer, (count + 1) / 2);
+    auto values = sized(count);
+
+    for (auto index = 0; index < count; ++index)
+    {
+        auto word = std::uint32_t {};
+        std::memcpy(&word, &words[index / 2], sizeof(word));
+
+        const auto half = index % 2 == 0 ? word & 0xFFFFu : word >> 16;
+        values[index] = eacp::GPU::bfloat16ToFloat((std::uint16_t) half);
+    }
+
+    return values;
+}
 
 // A whole model directory of the test's own: config.json, the weights, and —
 // for the sharded variant — the index naming the two files they are split

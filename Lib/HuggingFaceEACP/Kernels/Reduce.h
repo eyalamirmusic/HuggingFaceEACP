@@ -40,5 +40,35 @@ struct ReducingProgram : ComputeProgram
     // The threads one group holds, which is both what a strided walk steps by
     // and how many rows' worth of threads a dispatch asks for.
     const unsigned lanes;
+
+protected:
+    // The group's fold, through the SIMD-group intrinsic when this group **is**
+    // one SIMD group and through the whole-group one otherwise. A group at or
+    // under simdWidth is its own SIMD group, so the two fold the same threads
+    // and the narrow one does it with neither threadgroup scratch nor a
+    // barrier; a wider group is several, and simdSum there would hand each of
+    // them its own answer rather than the row's.
+    //
+    // The choice is made here rather than at each call site because the lane
+    // count is the caller's and every kernel built on this asks the same
+    // question of it. Every fold below sits outside the strided walk that feeds
+    // it, so control flow at the fold is uniform, which is what both forms
+    // require.
+    Float foldSum(const Float& value)
+    {
+        return foldsInOneSimdGroup() ? simdSum(value) : groupSum(value);
+    }
+
+    Float foldMax(const Float& value)
+    {
+        return foldsInOneSimdGroup() ? simdMax(value) : groupMax(value);
+    }
+
+    UInt foldMin(const UInt& value)
+    {
+        return foldsInOneSimdGroup() ? simdMin(value) : groupMin(value);
+    }
+
+    bool foldsInOneSimdGroup() const { return lanes <= (unsigned) simdWidth; }
 };
 } // namespace HF

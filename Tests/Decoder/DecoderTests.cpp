@@ -316,6 +316,59 @@ auto tBeginSequenceResets = test("Decoder/beginSequenceResetsTheSequence") = []
         check(first.hidden[index] == second.hidden[index]);
 };
 
+// The same decoding out of a BF16 checkpoint, which is the storage gemma-2b
+// itself ships and the one the whole model now stays in on the device: every
+// product reads its weight through readBFloat16 and the embedding gather reads
+// the same packed buffer the logits projection does.
+//
+// The reference is not given any allowance for that. It reads the checkpoint
+// through readFloats, which widens the very bytes the shader widens, so both
+// sides run on the bf16-rounded weights and what is left to disagree about is
+// float32 accumulation — the same tolerance the F32 path answers to.
+//
+// Both shapes are here because they are different kernels: the prompt's seven
+// rows take the tiled product and the prefill attention, and the tokens after
+// it take the split product a decode step runs on, which is where the four-wide
+// bf16 read lives.
+auto tBFloat16CheckpointMatchesReference =
+    test("Decoder/bfloat16CheckpointMatchesReference") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-bf16", Sharding::Single, asBFloat16()};
+
+    const auto shape = checkpoint.shape();
+    const auto tokens = promptTokens();
+    const auto expected = decodeOnTheCpu(checkpoint, tokens);
+
+    auto run = DecoderRun {shape, checkpoint.weights()};
+
+    // Said outright rather than left to the loader's own suite, so this test is
+    // self-contained about which path it is exercising: a checkpoint that
+    // arrived widened would still decode correctly here and would be testing
+    // the F32 kernels under a bf16 name.
+    check(run.loaded().tokenEmbedding.isPackedBFloat16());
+    check(run.loaded().layers[0].query.isPackedBFloat16());
+    check(run.loaded().layers[0].fusedGateUp.isPackedBFloat16());
+
+    auto worst = checkStepAgainstReference(
+        run.step(tokens), expected, shape, 0, (int) tokens.size());
+
+    run.beginSequence();
+
+    for (auto index = 0; index < (int) tokens.size(); ++index)
+    {
+        const auto result = run.step({tokens[(std::size_t) index]});
+
+        worst = std::max(
+            worst, checkStepAgainstReference(result, expected, shape, index, 1));
+    }
+
+    std::cout << "  bf16 checkpoint: worst error " << worst << "\n";
+};
+
 // The same decoding out of a checkpoint split across two shards, which is the
 // shape gemma-2b itself ships in. The weights are identical, so this is about
 // the index resolving every name rather than about the arithmetic.

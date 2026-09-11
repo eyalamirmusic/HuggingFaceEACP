@@ -136,7 +136,7 @@ public:
         , weights(ShardedTensors::fromModelFiles(files), decoderShape)
         , decoder(decoderShape)
     {
-        decoder.prepare(Device::shared());
+        decoder.prepare(Device::shared(), weights);
     }
 
     const GemmaConfig& config() const { return modelConfig; }

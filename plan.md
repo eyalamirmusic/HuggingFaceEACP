@@ -153,35 +153,71 @@ Decode is bandwidth bound: every token reads every weight once, so the storage
 format sets the ceiling. Prefill is compute bound and lands on the SIMD-group
 matrix product, which is already the fast path.
 
-| weight storage | bytes per token | rough ceiling on an M5 Max |
-| --- | --- | --- |
-| fp32 (what widening BF16 on the CPU gives today) | 10 GB | ~50 tokens/s |
-| bf16 kept packed | 5 GB | ~100 tokens/s |
-| int8 or int4 blocks, later | 1.3 to 2.5 GB | 200 to 400 tokens/s |
+| weight storage | bytes per token | rough ceiling | measured |
+| --- | --- | --- | --- |
+| fp32, widened on the CPU — step 5 replaced it | 10 GB | ~50 tok/s | 46 to 49 |
+| **bf16 kept packed — what runs today** | 5 GB | ~100 tok/s | **83 to 91** |
+| int8 or int4 blocks, later | 1.3 to 2.5 GB | 200 to 400 tok/s | |
+
+The measured column is one M-series device, Release, a 6-token prompt: 91
+tokens/s over 16 decode steps and 83 over 64, against 49 and 46 on the widened
+path. The ceilings were guesses from the bandwidth alone and the ratio came out
+at 1.8, which is what a bandwidth-bound step predicts.
 
 A step is roughly 18 layers × a dozen dispatches, a few hundred per token,
 which is the same order as the Whisper decoder's step.
 
+## Dependencies
+
+eacp comes from CPM at `develop`, and that is the only configuration this tree
+is built in — `CLAUDE.md` says why a local checkout drags whatever is
+uncommitted in it into this build.
+
+**Everything this tree asks of eacp is on `develop`.** Step 5's two rounds
+consume six additions — the BF16 reads, `readHalf4` / `readBFloat16x4`,
+`saturatingTanh`, `simdSum` / `simdMax` / `simdMin`,
+`Device::maxThreadgroupMemory` with `ComputeProgram::threadgroupMemoryBytes` and
+`fitsThreadgroupMemory`, and `ComputePipeline::threadExecutionWidth` — and all
+of them are there. For a fortnight they were not: they were written on a branch
+and this tree built only against a checkout of it, which is what the
+`-DCPM_eacp_SOURCE` override exists for and the one case it is for. That is
+over; the plain configure line is the whole story again.
+
+Which is the project's second goal working as intended, and worth recording as
+a shape rather than as an anecdote. Every one of those six was found by writing
+a real net against the compute layer and hitting the missing thing, went into
+eacp rather than into a workaround here, and came back as an API this tree then
+deleted code to use.
+
 ## What eacp is missing, ranked
 
-1. **A BF16 read in the EDSL.** The one that matters. Gemma ships BF16 and
-   WhisperEACP's loader widens it to fp32 on the CPU, which doubles the weights
-   on the GPU and halves decode speed. Converting to fp16 instead is lossy:
-   bf16 has an 8-bit exponent and fp16 a 5-bit one, so small weights flush and
-   nothing is bit-exact against the reference. The fix mirrors `readHalf`:
-   `readBFloat16(i)`, a two-wide sibling, and pack/unpack helpers. Widening is
-   an integer shift and `asFloat`, so it is exact and identical on MSL, HLSL at
-   `cs_5_0` and GLSL, with none of the narrowing divergence fp16 has if the
-   rounding is done in integer arithmetic. A small change, with `Tests/GPU`
-   coverage in the style of the `readHalf` tests. Downstream, `WeightStorage`
-   gains a BF16 case and the product kernels a third variant.
+1. **A BF16 read in the EDSL. Done, in eacp `develop`, and used here.** The one
+   that mattered. Gemma ships BF16 and the loader widened it to fp32 on the CPU,
+   which doubled the weights on the GPU and halved decode speed. Converting to
+   fp16 instead would have been lossy: bf16 has an 8-bit exponent and fp16 a
+   5-bit one, so small weights flush and nothing is bit-exact against the
+   reference. What landed is exactly the shape this asked for, mirroring
+   `readHalf`: `InputBuffer::readBFloat16(i)` counting bfloat16s,
+   `readBFloat16x2(i)` counting the words that hold two, `unpackBFloat16x2` /
+   `packBFloat16x2`, `writeBFloat16x2`, and `bfloat16FromFloat` /
+   `bfloat16ToFloat` on the host in `PackedVertex.h`. Widening is a shift and a
+   bitcast, so it is exact and bit-identical on every backend; the narrowing is
+   round-to-nearest-even written in integer arithmetic, so it is bit-identical
+   too, which `packHalf2` is not.
+
+   Downstream it is step 5's first round, below: `WeightStorage` has its third
+   case, every product kernel and the embedding gather have a bf16 variant, and
+   the loader uploads a BF16 tensor's bytes as they lie. Decode went from 49 to
+   91 tokens/s and the process from 14.4 GB resident to 10.3 GB.
 2. **`GPU::Buffer` sizes are `int`.** WhisperEACP's plan recorded this as the
    maintainer's decision, and for 2B in BF16 it holds: the embedding is
-   1.05 GB. Widened to fp32 it is 2.10 GB, 50 MB under the limit, and a 7B
-   embedding in fp32 is past it. If item 1 lands this is not blocking for 2B;
-   it blocks anything larger, or any fp32 path. Widen `Buffer`, `BufferRange`,
-   `read` and `update` to 64-bit before 7B rather than after. Shader-side
-   indexing is 32-bit and fine: the biggest tensor is 524 M elements.
+   1.05 GB. Widened to fp32 it was 2.10 GB, 50 MB under the limit, and a 7B
+   embedding in fp32 is past it. Item 1 has landed, so the largest buffer here
+   is now half what it was and this is not blocking for 2B; it blocks anything
+   larger, and it still blocks the logits buffer at a large prompt capacity —
+   see the step 3 and 4 notes below. Widen `Buffer`, `BufferRange`, `read` and
+   `update` to 64-bit before 7B rather than after. Shader-side indexing is
+   32-bit and fine: the biggest tensor is 524 M elements.
 3. **Zero-copy weight buffers on Metal.** `Buffer` always copies through
    `newBufferWithBytes`, so loading is a 5 GB memcpy and, while the mapping and
    the buffer both exist, 10 GB resident. Fine on 128 GB, painful on a 16 GB
@@ -215,26 +251,57 @@ which is the same order as the Whisper decoder's step.
    has the uint arithmetic already, so this is convenience rather than
    capability. It is the step from 100 to a few hundred tokens per second.
 
-Found while writing steps 1 and 2, unranked:
+Found while writing steps 1 and 2, unranked. **All four are filled**, on eacp
+`develop`, and all four are used here:
 
-- **Metal's `tanh` returns NaN for a large argument.** eacp compiles its Metal
-  library with fast math on and no `MTLCompileOptions`, and under that mode
-  `tanh(990)` is NaN rather than 1. tanh GELU's argument grows as the cube of
-  its input, so an activation of 30 hits it. `Gelu.h` clamps the argument to
-  ±10, past where `tanh` is exactly `1.0f`; the fix in eacp is a saturating
-  helper beside `eacpErf`, or explicit compile options.
-- **No SIMD-group-scoped reduction.** `groupSum` and `groupMax` always go
-  through threadgroup scratch and two barriers, even when the group is one
-  SIMD group wide. Inside attention's per-tile loop that is four barriers per
-  64 keys. A `simdSum`/`simdMax`, or `fold()` skipping the scratch when the
-  group fits a SIMD group, removes them.
-- **No threadgroup-memory budget in the EDSL.** `shared<T>(count)` is
-  compile-time and nothing reports what the backend allows, so Metal's 32 KB
-  is a number a kernel author has to know; the attention kernel caps the head
-  width at 256 by hand.
-- **`readHalf`-style vector reads emit scalar subscripts.** `InputBuffer::read4`
-  is four loads and an index round-trip rather than one 16-byte load. Correct,
-  just not the load it reads as.
+- **Metal's `tanh` returns NaN for a large argument. Done.** eacp compiles its
+  Metal library with fast math on and no `MTLCompileOptions`, and under that
+  mode `tanh(990)` is NaN rather than 1. tanh GELU's argument grows as the cube
+  of its input, so an activation of 30 hits it, and `Gelu.h` clamped the
+  argument to ±10 by hand. eacp's `saturatingTanh` is that clamp, and the tails
+  are answered with the constant rather than computed, ±10 itself included —
+  float32 resolves nothing between `tanh(9.011)` and one, so it is a repair of
+  the tails and not a different function. `Gelu.h` calls it, and the ±30 and
+  ±1000 cases in `Tests/Kernels` are what says so, through the standalone
+  activation and through the GeGLU the model actually dispatches.
+- **No SIMD-group-scoped reduction. Done, and used in one place.** `groupSum`
+  and `groupMax` went through threadgroup scratch and two barriers whatever the
+  group was. eacp now has `simdSum`/`simdMax`/`simdMin`, collective over exactly
+  one SIMD group of 32 and, on Metal, one instruction with neither scratch nor
+  barrier. Where it pays here is `SplitLinear` at `splits == simdWidth`: the
+  group is [32, 2], each SIMD group is exactly one output's lanes, and the fold
+  replaces 64 published partials and a serial walk of 32 of them. That count is
+  `logitsSplitCount`, so it is the widest product a decode step runs.
+  `ReducingProgram` picks the narrow fold for any kernel whose lane count is at
+  or under 32, which is a path the tests take and the decoder does not.
+
+  **It did not pay in attention, which is where this item was written from.**
+  Two whole-group folds per tile over 64 lanes is what the entry called four
+  barriers per 64 keys, and making the group one SIMD group removes them — and
+  measures *slower*: 76.6 tokens/s against 83.4 over 64 decode steps, since
+  halving the lanes doubles the tiles and halves the threads walking the head
+  width. Reverted, and recorded in `MultiQueryAttention.h` so it is not tried
+  again. A step already at memory bandwidth has no barrier cost left to save.
+- **No threadgroup-memory budget in the EDSL. Done.** eacp has
+  `Device::maxThreadgroupMemory()`, `ComputeProgram::threadgroupMemoryBytes()`
+  and `fitsThreadgroupMemory(device)`, so what a kernel declares and what a
+  device allows are both numbers rather than comments. `Decoder::prepare` runs
+  every one of its programs through a check that throws a `ModelError` naming
+  the kernel and both numbers, before a pipeline is built — eacp logs an
+  overspend and then lets the backend refuse, which on Metal happens after the
+  library compiled clean and points at the wrong thing.
+  `Kernels/multiQueryAttentionFitsTheThreadgroupBudget` asserts the attention
+  kernel's declared 1536 bytes against the device's 32768, and asserts that the
+  lane-major layout it was written instead of — 64 × 256 floats, 65536 bytes —
+  is past it. That last assertion is the one the comment used to make by hand.
+- **`readHalf`-style vector reads emit scalar subscripts. Done for the packed
+  pair.** `readHalf4` and `readBFloat16x4` take a record of four elements as the
+  two words holding it, which on Metal is one eight-byte load;
+  `storedWeight4` in `Kernels/WeightStorage.h` now reads through them, so all
+  three storages index by records of four and the call site never spells how
+  wide an element is. `read4` itself also lowers to a single `packed_float4`
+  load on Metal now. Neither moved a decode step, which is at memory bandwidth
+  — see step 5's second round.
 
 Found while writing steps 3 and 4, unranked:
 
@@ -242,9 +309,10 @@ Found while writing steps 3 and 4, unranked:
   `promptCapacity × 256000 × 4` bytes: 524 MB at the default 512 rows, and
   2048 rows is past what an `int` describes. `Gemma::prepare` counts it in
   64 bits and refuses with a `ModelError` naming this gap rather than
-  truncating the allocation. The widened F32 embedding, 2.10 GB, is bound
-  twice — as the gather's table and as the tied logits weight — and sits
-  50 MB under the limit.
+  truncating the allocation. The embedding is bound twice — as the gather's
+  table and as the tied logits weight — and at 2.10 GB widened sat 50 MB under
+  the limit; packed it is 1.05 GB, so since step 5 the logits buffer is the
+  only thing here anywhere near the ceiling.
 - **`commitAsync` cannot drive a generation loop.** Its `Async` resolves on
   the main thread, and a loop that never returns to the run loop never sees
   it — eacp's own header says so. `submit()` and the scoped
@@ -258,11 +326,73 @@ Found while writing steps 3 and 4, unranked:
   ring before it returns; WhisperEACP's `Whisper` carries the same latent
   race. A `Buffer::update` that waited for in-flight writers, or a documented
   rule that it does not, belongs in eacp.
-- **No raw-bytes concatenation in the loader.** Fusing gate and up goes through
-  `readFloats`, so an fp16 repo pays a widened copy of the largest weight per
-  layer where a packed stack would have kept it half the size. Costs Gemma's
-  BF16 checkpoint nothing, since it is widened regardless; gone once gap 1
-  lands and the packed read exists. Ours, not eacp's, but decided by gap 1.
+- **No raw-bytes concatenation in the loader. Done, in step 5's first round.**
+  Fusing gate and up went through `readFloats`, so a packed repo paid a widened
+  copy of the largest weight per layer. It is now
+  `TensorLoader::loadStackedProjectionWeights`, which stacks the two tensors'
+  raw bytes and reports the storage both halves share — so F32, fp16 and bf16
+  all go up at the shape the file has them in, and only a pair whose types
+  disagree, whose type no kernel reads, or whose first half has an odd element
+  count falls back to widening. That last one is the whole of what the byte
+  path has to be careful about: a packed read fetches the word an index lands
+  in, so the second half has to begin on one. Gemma's halves are
+  [16384, 2048].
+
+Found while writing step 5's bf16 round, unranked. Both are about the same
+thing — a packed weight is widened one element at a time and the rest of the
+machine only takes fp32 — and the first is the cheap one:
+
+- **No four-wide packed read.** The packed family stops at two: `readHalf2` and
+  `readBFloat16x2` each fetch one word and give a `Float2`. The float family
+  goes to four, and `read4` is what `SplitLinear`'s hot loop uses — a run of
+  four weights against a `read4` of the input, which is the shape a decode step
+  spends nearly all its bandwidth in. So the packed variants call
+  `readBFloat16x2(i / 2)` and `readBFloat16x2(i / 2 + 1)` and assemble a
+  `Float4` by hand, which is two indexed loads where the float path has one.
+  A `readHalf4(i)` / `readBFloat16x4(i)` taking a four-aligned element index,
+  fetching the two words as one eight-byte load and unpacking four, would be
+  the same call for the same shape. The unranked `read4` item above compounds
+  it: even the float path's one load lowers to four scalar subscripts today, so
+  neither is the load it reads as. A `UIntInputBuffer::read4` plus four
+  `unpackBFloat16x2` calls is the workaround, and it is not taken here because
+  it makes the *uniform's declared type* depend on the weight's storage, which
+  would reach every product kernel's member list rather than its read.
+
+- **The SIMD-group matrix cannot take a packed operand.** `simdMatrix` loads a
+  fragment from a `Shared<Float>` tile, an `InputBuffer` or an `OutputBuffer` —
+  all fp32 — so `SimdTiledMatMulProgram` widens each bf16 weight on the way
+  into threadgroup memory and the fragment load reads fp32 from there. The
+  global traffic is halved, which is the win this round measured, but the
+  32 x 64 staging block of B is still 8 KB of the 32 KB budget rather than
+  4 KB, and there is a widen per element per tile that the hardware would do
+  for free. Two things would fix it, and the second is the real one:
+  `shared<T>` over a packed sixteen-bit type with a `simdMatrix` overload that
+  loads a fragment from it, and — better — a `simdMatrix(const InputBuffer&,
+  offset, rowStride)` sibling that loads an 8 x 8 fragment straight out of a
+  packed device buffer, which for a ContiguousK weight would remove the B
+  staging and its two barriers entirely. Metal has `simdgroup_bfloat8x8` and
+  `simdgroup_half8x8` to lower both onto; a backend without them widens, which
+  is what this file does by hand today.
+
+  **Left open, and it is an eacp policy question rather than a kernel one.**
+  Taken to eacp with the rest of this list, it came back as the one item not
+  filled: `bfloat` and `simdgroup_bfloat8x8` are Metal 3.1, which is macOS 14,
+  and eacp's deployment target is macOS 11. The fallback on an older OS is the
+  staging this file already does, so the same kernel would carry a barrier on
+  one OS and not on the other — a collective point that exists or does not
+  depending on the SDK, which is the worst shape a barrier can have. Three ways
+  out, none of them free:
+
+  - raise eacp's GPU floor to macOS 14, and the overload is unconditional;
+  - gate it on `__METAL_VERSION__` with the staging fallback behind it, and
+    document that the barrier is there on one branch and not the other — the
+    kernel author then has to write for the branch that has it;
+  - expose it as a feature level that withholds the overload where it cannot
+    be had, so a kernel asks and takes the staging path itself when the answer
+    is no.
+
+  Nothing here needs it before quantization, which changes the operand format
+  again.
 
 Already filled since the Whisper rounds: 3D dispatch exists, so the head no
 longer has to be folded into the dispatch row; `CommandTimer` times
@@ -313,6 +443,28 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    the tier exists for. The elementwise differences measure 8.4e-3, 1.02e-2 and
    3.6e-3 relative over the three prompts — 0.025, 0.043 and 0.013 absolute,
    on logits reaching 88.6, 113.4 and 74.9 — and 8.4e-3 one token at a time.
+
+   Two rounds of step 5 have moved them in the fourth significant digit and no
+   further, which is worth a table since it is the one number that says the
+   arithmetic is still the same arithmetic:
+
+   | | widened F32 | packed BF16 | + the eacp round |
+   | --- | --- | --- | --- |
+   | `A:` | 8.3794e-3 | 8.3794e-3 | 8.35314e-3 |
+   | `In 1969 …` | 1.02258e-2 | 1.02258e-2 | 1.02578e-2 |
+   | `def add(a, b):` | 3.60951e-3 | 3.60951e-3 | 3.59328e-3 |
+   | one token at a time | 8.36572e-3 | 8.36572e-3 | 8.36879e-3 |
+
+   The middle column is exact against the first because the shader widens the
+   same bytes in the same order. The third moved because the order changed: the
+   logits fold at 32 splits is a SIMD tree rather than a serial walk of 32
+   partials, and eacp's `read4` became one `packed_float4` load on Metal, which
+   is enough to change how the compiler contracts a `dot`. Holding the fold out
+   and leaving the load in reproduced the third column's prompt figures exactly,
+   so the load is nearly all of it. Every argmax and every top-5 still agrees,
+   and the largest of them is a fifth of `logitTolerance`. The third column was
+   measured against eacp's branch and then again against `develop` once the
+   merge landed, and the two are identical digit for digit.
    That is what a 2048-wide fp32 dot product summed in two different orders
    through eighteen layers costs, and it tracks the magnitude a row reaches
    rather than anything else, so the provisional 2e-3 is now
@@ -367,11 +519,101 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
 
    Timings, Debug, one M-series device, 16 tokens from a 6-token prompt: 38 s
    to load and upload (the BF16 widening on the CPU, which is gap 1), 0.36 s
-   of prefill, and 0.29 s of decode — about 56 tokens/s.
-5. Performance rounds: the BF16 read lands in eacp first, since it decides the
-   whole memory budget; then the fused GeGLU, the split counts (the decoder's
-   64 and 32 are WhisperEACP's numbers, unmeasured on Gemma's widths), and
-   the prompt-capacity and lane-count guesses.
+   of prefill, and 0.29 s of decode — about 56 tokens/s. **Step 5's first round
+   took the widening out**, and the same run is now 15 s to load and upload,
+   0.12 s of prefill and 0.18 s of decode, about 90 tokens/s. What is left of
+   that 15 s is mostly the 17.5 MB `tokenizer.json` through Miro's JSON in a
+   Debug build, not the weights: the same run in Release loads in 0.9 s.
+5. **First round done: the weights stay bf16.** The BF16 read went into eacp
+   first, since it decides the whole memory budget, and this round is what
+   consumes it. `WeightStorage` has a `PackedBFloat16` case; `MatMul`, `Linear`,
+   `SplitLinear`, `TiledMatMul` and `SimdTiledMatMul` each read their weight
+   through one `storedWeight` / `storedWeight4` written once in `MatMul.h`, so
+   a fourth storage would be one edit rather than five; and `Embed` became a
+   template over the same enum. The loader uploads a BF16 or an F16 tensor's
+   bytes as they lie, padding an odd element count to a whole word, and the
+   fused gate-and-up weight is stacked as bytes — see the concatenation item
+   above. Everything a product reads is packed. The two RMSNorm scales per
+   layer are widened on the way up, deliberately: they are [2048] each, and the
+   alternative is a packed read in every small kernel a tensor can reach.
+
+   **The embedding is the case that decided the gather's shape.** It is bound
+   twice, as the gather's table and as the tied logits weight, so a gather with
+   only a float form would have forced the largest tensor in the model to stay
+   widened whatever the product could read. `EmbedProgram` is parameterised by
+   `WeightStorage` for that one reason, and the embedding is 1.05 GB rather
+   than 2.10 GB because of it.
+
+   **Three storages is twelve pipelines, and a run dispatches four.**
+   `Decoder::prepare` therefore takes the weights: it reads
+   `DecoderWeights::storages()` and compiles the gather, the tiled product and
+   the two split products that storage needs, leaving the other eight empty.
+   Compiling all of them built two whole SIMD-group matrix pipelines nothing
+   would ever bind. A step against weights in a storage the decoder was not
+   prepared for is a `ModelError` raised beside the shape check, before
+   anything is recorded.
+
+   **What it cost and what it bought.** Nothing in the numbers moved: the
+   oracle's elementwise differences are 8.4e-3, 1.02e-2 and 3.6e-3 relative on
+   the three prompts and 8.4e-3 one token at a time, which are the widened
+   path's figures to every digit recorded. They have to be — the shader widens
+   the same bytes the CPU used to, in the same order, so the arithmetic is
+   identical rather than merely close, and every argmax and top-5 still agrees
+   with llama.cpp. Release, 6-token prompt, one M-series device:
+
+   | | widened F32 | packed BF16 |
+   | --- | --- | --- |
+   | load and upload | 1.57 s | 0.94 s |
+   | prefill, 6 rows | 0.44 s | 0.12 s |
+   | decode, 16 tokens | 0.325 s, 49 tokens/s | 0.175 s, 91 tokens/s |
+   | decode, 64 tokens | 1.39 s, 46 tokens/s | 0.77 s, 83 tokens/s |
+   | peak resident | 14.42 GB | 10.34 GB |
+   | peak footprint | 11.25 GB | 6.38 GB |
+
+   Decode is 1.8x, which is what halving a bandwidth-bound step's traffic
+   predicts. Prefill is 3.6x rather than 2x, and the extra is first-touch of
+   half as many pages on a run this short rather than anything in the
+   arithmetic. The 4.9 GB of footprint is the weights: 2.5 B parameters at four
+   bytes against two, to within the rounding. Resident is 4.1 GB rather than
+   4.9 because the 5 GB safetensors mapping is counted in both runs and how
+   much of it stays resident is the page cache's business, not ours.
+
+   **Second round: the rest of the eacp gaps, and what they were worth.** The
+   four unranked items from steps 1 and 2 plus the four-wide packed read all
+   landed in eacp together, and this tree now uses every one of them —
+   `saturatingTanh` in `Gelu.h`, `readBFloat16x4`/`readHalf4` in
+   `storedWeight4`, `simdSum` in `SplitLinear` at the logits' split count and
+   in `ReducingProgram` below 32 lanes, and the threadgroup budget as a
+   prepare-time refusal in `Decoder`. See the gap list for what each one
+   replaced.
+
+   **None of them moved the clock, and the reason is the same one the table at
+   the top gives.** Release, 6-token prompt, against the first round's numbers:
+
+   | | round one | round two |
+   | --- | --- | --- |
+   | load and upload | 0.94 s | 0.84 s |
+   | prefill, 6 rows | 0.12 s | 0.11 s |
+   | decode, 16 tokens | 91 tokens/s | 92.6 tokens/s |
+   | decode, 64 tokens | 83 tokens/s | 83.4 tokens/s |
+
+   A decode step reads 5.0 GB of weights and runs at 92.6 tokens/s, which is
+   463 GB/s — at what the memory system gives. Every one of these changes
+   removes arithmetic, loads or barriers, and none of them removes bytes, so
+   there was nothing left for them to buy. That is worth writing down rather
+   than treating as a disappointment: it says the next round is int8 or int4
+   and not another pass over the kernels, and it is the same conclusion the
+   attention lane-count experiment reached from the other direction.
+
+   The oracle moved in the fourth significant digit — see the table under step
+   3 — and holding the `simdSum` fold out showed that almost all of it is
+   eacp's own `read4` lowering rather than anything here.
+
+   Still to do in this step: the fused GeGLU, the split counts (the decoder's
+   64 and 32 are WhisperEACP's numbers, and 32 now also buys the SIMD-scoped
+   fold, which is a reason to keep it that measurement did not supply), and the
+   prompt-capacity guess. The two gaps the bf16 round turned up are at the end
+   of the gap list, one filled and one left open.
 6. **Half done.** `Sampling` is the CPU sampler — temperature, top-k, top-p in
    Hugging Face's processor order, a seeded draw the standard specifies so a
    seed means the same token sequence on every machine — and a temperature
@@ -389,8 +631,21 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
   reachable from a configure line rather than from a paragraph; it would also
   put 10 GB and a `pip install` behind a switch that currently only costs
   compile time. Left as a step, not taken.
-- Does the BF16 read go into eacp now, so this project never carries a widened
-  fp32 path at all?
+- ~~Does the BF16 read go into eacp now, so this project never carries a
+  widened fp32 path at all?~~ **Settled: it went in.** The widened path is not
+  gone, though, and should not be — `WeightStorage::Float` is what an F32 repo
+  and every synthetic test checkpoint take, and `makeFloatBuffer` is what the
+  norm scales take. What went is the widening of the *weights*, which is the
+  only place it cost anything.
 - Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B? The
-  logits buffer now hits the limit at a prompt capacity of 2048 rows, so it
-  is a 2B question too, though one a smaller prefill block sidesteps.
+  logits buffer still hits the limit at a prompt capacity of 2048 rows, so it
+  is a 2B question too, though one a smaller prefill block sidesteps. The
+  packed weights removed the other half of the pressure: the embedding is
+  1.05 GB now rather than 2.10 GB.
+- **What does eacp do about `simdgroup_bfloat8x8`?** The one gap taken to eacp
+  and not filled, because it is a deployment-target question rather than a
+  codegen one: the packed fragment load needs Metal 3.1, which is macOS 14,
+  against eacp's floor of 11. Raise the floor, gate it and document a barrier
+  that exists on one OS and not the other, or expose a feature level a kernel
+  asks — the three are spelled out under the gap itself. Nothing here needs it
+  before quantization, which changes the operand format again anyway.

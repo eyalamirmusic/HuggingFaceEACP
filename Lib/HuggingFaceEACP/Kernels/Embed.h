@@ -1,6 +1,6 @@
 #pragma once
 
-#include "KernelTypes.h"
+#include "WeightStorage.h"
 
 namespace HF
 {
@@ -36,9 +36,16 @@ namespace HF
 // wrote at the end of one step be the id this reads at the start of the next
 // without a trip through the host: a vocabulary is indexed, not measured, and
 // the buffer's element type says so on both backends.
-struct Embed final : ComputeProgram
+//
+// The table takes a WeightStorage for the reason the products do, and it is the
+// tied embedding that asks: the same buffer is the gather's table and the
+// logits projection's weight, so a gather with only a float form would have
+// forced the largest tensor in the model to be widened however the product read
+// it. storedWeight is the same widening either kernel does.
+template <WeightStorage tableStorage>
+struct EmbedProgram final : ComputeProgram
 {
-    Embed() { compile(); }
+    EmbedProgram() { compile(); }
 
     void define() override
     {
@@ -47,10 +54,10 @@ struct Embed final : ComputeProgram
         auto step = position.y;
 
         auto token = tokens[step];
+        auto element = token * width + channel;
+        auto gathered = storedWeight<tableStorage>(tokenTable, element);
 
-        write(output,
-              step * width + channel,
-              scale * tokenTable[token * width + channel]);
+        write(output, step * width + channel, scale * gathered);
     }
 
     Uniform<UIntInputBuffer> tokens;
@@ -61,4 +68,8 @@ struct Embed final : ComputeProgram
 
     EACP_SHADER(tokens, tokenTable, output, width, scale)
 };
+
+using Embed = EmbedProgram<WeightStorage::Float>;
+using HalfWeightEmbed = EmbedProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightEmbed = EmbedProgram<WeightStorage::PackedBFloat16>;
 } // namespace HF

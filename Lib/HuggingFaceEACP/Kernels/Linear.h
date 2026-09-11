@@ -1,8 +1,7 @@
 #pragma once
 
 #include "Gelu.h"
-#include "KernelTypes.h"
-#include "MatMul.h"
+#include "WeightStorage.h"
 
 #include <algorithm>
 
@@ -60,14 +59,9 @@ struct LinearProgram final : ComputeProgram
         write(output, row * outputWidth + column, total.get() + bias[column]);
     }
 
-    // Exactly representable either way round, so the packed form is the same
-    // number the widened one is rather than the same number to a tolerance.
     Float weight(const UInt& index)
     {
-        if constexpr (weightStorage == WeightStorage::PackedHalf)
-            return weights.readHalf(index);
-        else
-            return weights[index];
+        return storedWeight<weightStorage>(weights, index);
     }
 
     Uniform<InputBuffer> input;
@@ -82,6 +76,7 @@ struct LinearProgram final : ComputeProgram
 
 using Linear = LinearProgram<WeightStorage::Float>;
 using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightLinear = LinearProgram<WeightStorage::PackedBFloat16>;
 
 // The same product for a handful of rows — a decode step's one token, or the
 // prompt's two — where a thread per output is a thread per 2048 or 16384
@@ -185,6 +180,26 @@ struct SplitLinearProgram final : ComputeProgram
 
         auto local = localPosition();
 
+        // **One output to a SIMD group is the fold this kernel wants.** At
+        // splits == simdWidth the group is [32, 2], threads are flattened x
+        // first, and each SIMD group is therefore exactly one output's lanes —
+        // so simdSum hands every lane its own output's inner sum with neither
+        // threadgroup scratch nor a barrier, where the general case below
+        // publishes 64 partial sums and walks 32 of them serially. That count
+        // is the logits projection's own, which is the widest product a decode
+        // step runs.
+        //
+        // Narrower and a SIMD group spans several outputs, which would fold
+        // them together; wider and one output spans several, which would leave
+        // each holding a part. Both keep what they had.
+        if (splits == (unsigned) simdWidth)
+        {
+            auto sum = var(simdSum(total.get()));
+
+            ifThen(local.x == 0u, [&] { store(sum.get(), element, column, row); });
+            return;
+        }
+
         if (outputsPerGroup == 1)
         {
             auto sum = var(groupSum(total.get()));
@@ -226,21 +241,12 @@ struct SplitLinearProgram final : ComputeProgram
 
     Float weight(const UInt& index)
     {
-        if constexpr (weightStorage == WeightStorage::PackedHalf)
-            return weights.readHalf(index);
-        else
-            return weights[index];
+        return storedWeight<weightStorage>(weights, index);
     }
 
-    // Four consecutive weights from a four-aligned index: one record of the
-    // float buffer, or the two words that hold four halves.
     Float4 weight4(const UInt& index)
     {
-        if constexpr (weightStorage == WeightStorage::PackedHalf)
-            return float4(weights.readHalf2(index / 2u),
-                          weights.readHalf2(index / 2u + 1u));
-        else
-            return weights.read4(index / 4u);
+        return storedWeight4<weightStorage>(weights, index);
     }
 
     Uniform<InputBuffer> input;
@@ -272,4 +278,5 @@ struct SplitLinearProgram final : ComputeProgram
 
 using SplitLinear = SplitLinearProgram<WeightStorage::Float>;
 using HalfWeightSplitLinear = SplitLinearProgram<WeightStorage::PackedHalf>;
+using BFloat16WeightSplitLinear = SplitLinearProgram<WeightStorage::PackedBFloat16>;
 } // namespace HF
