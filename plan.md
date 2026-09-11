@@ -68,10 +68,29 @@ pinned to a commit — which is gap 4 below and is how the build now gets a
 model. The mirror is **unsharded**: one 5.0 GB `model.safetensors` in place of
 the two shards and the index above. It carries `tokenizer.model` too, though
 the fetch does not take it — nothing here reads the SentencePiece original —
-and what it has no copy of at all is `gemma-2b.gguf`. The GGUF is what
-`Tests/Oracle` reads, and it is the one thing
-still worth doing Google's gated download for; `GEMMA_MODEL_DIR` is how a
-machine that has done it says so.
+and what it has no copy of at all is `gemma-2b.gguf`.
+
+The GGUF is what `Tests/Oracle` reads, and it **no longer takes Google's
+download either**: `convert_hf_to_gguf.py`, out of the llama.cpp tree this
+build already pins at `b10900`, writes one from the fetched safetensors.
+
+```bash
+build/_deps/llama-cpp-src/convert_hf_to_gguf.py <staged> --outtype f32 \
+      --outfile $HOME/Code/models/gemma-2b/gemma-2b.gguf
+```
+
+`<staged>` is a directory holding the four fetched files plus the three the
+converter reads and the fetch does not take — `tokenizer.model`,
+`tokenizer_config.json` and `special_tokens_map.json` — which come from the
+same `unsloth/gemma-2b` commit CMake pins, so nothing in it is from anywhere
+else. The result is 10 GB of F32 and about a minute of writing, and it differs
+from Google's own file in one key: the converter leaves out
+`gemma.rope.freq_base` when it took its default, so
+`Oracle/Decoder/configMatchesGguf` reports `rope_theta` rather than asserting
+it. `GEMMA_MODEL_DIR` is how a machine that has run the conversion says where
+it went. A CMake target that runs it is a possible later step, and is not
+written: it wants a Python environment and 10 GB, neither of which the rest of
+this build needs.
 
 `gemma-2b` is the base completion model. `gemma-2b-it` is the same architecture
 with a chat prompt format, so supporting both is a prompt change only.
@@ -179,10 +198,11 @@ which is the same order as the Whisper decoder's step.
    so `HF_EACP_FETCH_MODEL` fetches the four files from it at a pinned commit,
    `hf_bundle_model(<target>)` copies them beside a binary, and
    `Gemma::loadBundled()` finds the copy. Nothing has to be arranged by hand.
-   `GEMMA_MODEL_DIR` stays as the explicit override, and is what a machine that
-   *has* done Google's gated download names it with — the GGUF beside the
-   safetensors is the one thing the mirror does not carry, and `Tests/Oracle`
-   reads it.
+   `GEMMA_MODEL_DIR` stays as the explicit override, and is also what points
+   `Tests/Oracle` at `gemma-2b.gguf`. That is the one file the mirror does not
+   carry, and it is converted out of these same safetensors by the llama.cpp
+   tree this build already pins — see "The repo" above — so the gate is now
+   behind us for every purpose and nothing here needs a Hugging Face token.
 5. **Threading.** eacp's GPU layer is main-thread only. Two hundred tokens at
    10 ms each is two seconds of message thread if driven synchronously.
    `commitAsync` and the scoped wait exist, so record several steps per command
@@ -273,10 +293,10 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    unconditionally. The kernels' own references never needed a checkpoint, and
    the suites that do now get one from the build's fetch — a test skips only
    in a build configured with `-DHF_EACP_FETCH_MODEL=OFF`.
-3. **Run, against the real checkpoint.** `Decoder` is the forward pass over a
-   KV cache, one compute pass per step, checked against a double-precision
-   reference over a synthetic checkpoint the tests write (2e-7 relative,
-   asserted at 5e-6),
+3. **Done, and run against the real checkpoint and the oracle.** `Decoder`
+   is the forward pass over a KV cache, one compute pass per step, checked
+   against a double-precision reference over a synthetic checkpoint the tests
+   write (2e-7 relative, asserted at 5e-6),
    through both the many-row tiled product and the one-row split product,
    and through a two-shard checkpoint. The llama.cpp comparison exists behind
    `HF_EACP_ENABLE_LLAMA_CPP` — llama.cpp pinned at `b10900`, every ggml
@@ -284,10 +304,19 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    prefill and token-by-token logits against its rows, an eight-token greedy
    continuation, and the config's numbers against the GGUF's header, which is
    what retires the "confirm every number" caveat above. Every one of them
-   still skips until `GEMMA_MODEL_DIR` names a directory holding
-   `gemma-2b.gguf`, which is Google's own gated download and not the mirror the
-   build fetches, so the elementwise tolerance there is provisional and the
-   argmax and top-5 agreement is the assertion that matters. What changed
+   skips until `GEMMA_MODEL_DIR` names a directory holding `gemma-2b.gguf`,
+   which the mirror does not carry but which this tree's own llama.cpp converts
+   out of the fetched safetensors — see "The repo".
+
+   **They have run.** Every row's argmax and every row's five largest tokens
+   agree, on all three prompts and one token at a time, which is the assertion
+   the tier exists for. The elementwise differences measure 8.4e-3, 1.02e-2 and
+   3.6e-3 relative over the three prompts — 0.025, 0.043 and 0.013 absolute,
+   on logits reaching 88.6, 113.4 and 74.9 — and 8.4e-3 one token at a time.
+   That is what a 2048-wide fp32 dot product summed in two different orders
+   through eighteen layers costs, and it tracks the magnitude a row reaches
+   rather than anything else, so the provisional 2e-3 is now
+   `logitTolerance = 5e-2`, five times the worst of them. What changed
    against the plan:
    gate and up are concatenated at load into one `[32768, 2048]` weight, so
    the MLP is one product, one GeGLU and the down product with the residual
@@ -305,7 +334,7 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    CPU argmax, over a synthetic `tokenizer.json` of the model's width.
 
    **What the first run against the real checkpoint showed.** Three things,
-   two of them corrections and one of them open:
+   all three now settled:
 
    - `config.json` carries `"hidden_activation": null` beside a
      `"hidden_act": "gelu"`, and the loader threw on it — `stringFieldOr`
@@ -315,14 +344,26 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
      treats an explicit null as the default and only an absent key defers to
      the older spelling. Nothing dispatches on the value; it is recorded.
    - The 256 byte pieces are 255. See item 1 above: id 226 is a literal tab.
-   - **Greedy from "The capital of France is" does not reach Paris.** It
-     produces `" a city of contrasts. It is a city of history, of art, of"`,
-     which is fluent and on-topic, so the whole stack is doing something
-     coherent — but `Generation/Gemma/completesAPrompt` asserts `Paris` and
-     that assertion fails. Unresolved and deliberately left failing: whether
-     this is our arithmetic or what greedy gemma-2b actually says is exactly
-     what `Tests/Oracle` is for, and it needs the GGUF the mirror does not
-     carry. That is now the top open question.
+   - **Greedy from "The capital of France is" does not reach Paris — and is
+     right not to.** It produces `" a city of contrasts. It is a city of
+     history, of art, of"`, and so does everything else. Three independently
+     written implementations agree on the ids
+     `[476, 3413, 576, 82777, 235265, 1165, 603, 476]` token for token: our
+     GPU decoder, llama.cpp over the F32 GGUF on ggml's CPU path, and Hugging
+     Face transformers in fp32 on the CPU. At the sampled row ' a' is -16.5291
+     and ' Paris' -16.8554, then ' the' -17.0254, ' one' -17.273 and
+     ' also' -17.8572 — Paris is the model's second choice and loses by 0.326
+     logits, which is eight times the largest elementwise disagreement the
+     oracle has ever measured between our logits and llama.cpp's. The one
+     thing that might plausibly have moved it — the embedding normalizer,
+     `sqrt(2048)` rounded to bf16's 45.25 against fp32's 45.254833 — was run
+     both ways and the top five come back bit-identical. So the base model is
+     not answering a question here; it is continuing a sentence, which is what
+     a base model does. `Generation/Gemma/completesAPrompt` and the two oracle
+     greedy tests now probe with `"Q: What is the capital of France?\nA:"`,
+     whose answer is ' Paris' at -1.0616 against ' paris' at -5.9548: the same
+     claim about the same stack, with a 4.89-logit margin behind it instead of
+     a 0.326-logit one.
 
    Timings, Debug, one M-series device, 16 tokens from a 6-token prompt: 38 s
    to load and upload (the BF16 widening on the CPU, which is gap 1), 0.36 s
@@ -340,12 +381,14 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
 
 ## Open decisions
 
-- **Why does greedy gemma-2b not say Paris here?** The one failing test, and
-  the only question the tiers below it cannot answer on their own. Settling it
-  means the llama.cpp oracle over `gemma-2b.gguf`, which means Google's gated
-  download — so the next move is either doing that download once by hand and
-  pointing `GEMMA_MODEL_DIR` at it, or finding an ungated F32 GGUF of the same
-  weights the fetch could take.
+- **Should the conversion into `gemma-2b.gguf` be a build target?** It is a
+  command a person runs once, written down in "The repo" above, and everything
+  it needs is already in the tree — the pinned llama.cpp checkout, the fetched
+  safetensors — except a Python environment with `torch` and the three
+  tokenizer files the fetch does not take. A target would make the oracle tier
+  reachable from a configure line rather than from a paragraph; it would also
+  put 10 GB and a `pip install` behind a switch that currently only costs
+  compile time. Left as a step, not taken.
 - Does the BF16 read go into eacp now, so this project never carries a widened
   fp32 path at all?
 - Widen `Buffer` to 64-bit in the same eacp change, or defer until 7B? The

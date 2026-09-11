@@ -16,8 +16,8 @@
 // The model ships with the binary: the build fetches gemma-2b and copies it
 // beside this executable, and a run with no arguments but a prompt loads that.
 // GEMMA_MODEL_DIR is the explicit override, and it wins when set — which is
-// how a run is pointed at Google's own gated download, the one that carries
-// gemma-2b.gguf beside the safetensors for the oracle tests.
+// how a run is pointed at a checkpoint of its own, the oracle tests' directory
+// with gemma-2b.gguf beside the safetensors among them.
 //
 // Inside eacp::Apps::run for the reason every GPU-touching thing here is: the
 // Metal backend is written against the run loop and autorelease pool that owns,

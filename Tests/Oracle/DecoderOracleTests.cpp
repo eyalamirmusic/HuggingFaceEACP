@@ -40,18 +40,23 @@
 // bits — nor do exp, rsqrt and tanh, which are the backend's rather than
 // libm's.
 //
-// **The elementwise bound is provisional.** isClose(a, e, 2e-3) allows
-// |a - e| <= 2e-3 * (1 + |e|), which at a logit of 20 is about 0.04. Nothing
-// has run this yet, so that number is an expectation and not a measurement:
-// what a run should be read for is the max |a - e| each test prints, and the
-// bound replaced with a stated multiple of it the way Tests/Decoder's 5e-6 is
-// a multiple of its own measured 2.1e-7. If the elementwise check fails while
-// the argmax and the top five agree, the tolerance is what is wrong; if the
-// argmax disagrees, we are.
+// **The elementwise bound is a multiple of what a run measured.** isClose(a,
+// e, t) allows |a - e| <= t * (1 + |e|), which is what compareRow reports as
+// its relative difference, so the bound and the printed number are the same
+// quantity. Over the three prompts below a run measures 8.4e-3, 1.02e-2 and
+// 3.6e-3 relative — absolute differences of 0.025, 0.043 and 0.013 on logits
+// reaching 88.6, 113.4 and 74.9 — and 8.4e-3 again one token at a time. That
+// is what a 2048-wide fp32 dot product summed in two different orders through
+// eighteen layers costs, and it tracks the magnitude a row reaches rather than
+// anything else. logitTolerance is five times the worst of them. If the
+// elementwise check fails while the argmax and the top five agree, the
+// tolerance is what is wrong; if the argmax disagrees, we are.
 //
 // Everything skips without a device, without a checkpoint, and without the
-// GGUF beside the safetensors — which the fetched mirror does not carry, so it
-// takes GEMMA_MODEL_DIR pointing at Google's own download.
+// GGUF beside the safetensors. The fetched mirror does not carry one, but the
+// pinned llama.cpp tree's convert_hf_to_gguf.py makes it from the fetched
+// safetensors at --outtype f32, so GEMMA_MODEL_DIR names wherever that was
+// written rather than a gated download.
 
 using namespace nano;
 using namespace HF;
@@ -67,22 +72,30 @@ namespace
 // runs out first, and so the two are the same claim about the same window.
 constexpr auto oracleWindow = LlamaOracle::defaultContextSize;
 
-// See the note above: an expectation, not a measurement.
-constexpr auto logitTolerance = 2e-3;
+// Five times the worst relative difference the three prompts have measured.
+// See the note above for what that measurement was.
+constexpr auto logitTolerance = 5e-2;
 
 // How many of a row's largest tokens have to be the same set. Five is past
 // where a sampler's top-k usually cuts and far enough down the row that
 // agreeing on it is a claim about the distribution rather than about its peak.
 constexpr auto topTokens = 5;
 
-constexpr auto capitalPrompt = std::string_view {"The capital of France is"};
+// The probe Tests/Generation asserts on, here for the same reason: greedy
+// gemma-2b answers this one with " Paris" by 4.89 logits, where it continues
+// "The capital of France is" with " a city of contrasts" — which llama.cpp
+// below and Hugging Face transformers in fp32 both agree is what the weights
+// say.
+constexpr auto capitalPrompt =
+    std::string_view {"Q: What is the capital of France?\nA:"};
+
 constexpr auto greedySteps = 8;
 
-// Three prompts rather than one: a bare noun phrase, a sentence with
-// punctuation and digits, and the one the greedy test continues. Tokenized by
-// our tokenizer on both sides, since TokenizerOracleTests already checks that
-// it agrees with llama.cpp's piece for piece — so a difference here cannot be
-// a different sequence of tokens.
+// Three prompts rather than one: the one the greedy test continues, a sentence
+// with punctuation and digits, and a line of code. Tokenized by our tokenizer
+// on both sides, since TokenizerOracleTests already checks that it agrees with
+// llama.cpp's piece for piece — so a difference here cannot be a different
+// sequence of tokens.
 const auto promptCases = std::vector<std::string> {
     std::string {capitalPrompt},
     "In 1969 the first crewed landing on the Moon took place.",
@@ -297,8 +310,8 @@ bool sameTokens(Span<const TokenId> ours, Span<const TokenId> theirs)
 }
 
 // Every row of one step against the oracle's rows for the same tokens, with
-// the two assertions that matter reported separately from the one that is a
-// guess. Returns what the run measured, for the caller to print.
+// the two assertions that matter reported separately from the elementwise
+// bound. Returns what the run measured, for the caller to print.
 struct RowAgreement
 {
     RowDifference difference;
@@ -344,7 +357,8 @@ void reportAndCheck(std::string_view what, const RowAgreement& agreement)
     check(agreement.everyArgmaxAgrees, "every row's argmax agrees");
     check(agreement.everyTopSetAgrees, "every row's five largest are the same five");
 
-    // And the provisional one, which is the number a run is read for.
+    // And the elementwise one, which is the number the bound was set from and
+    // is what a run is read for.
     check(agreement.difference.everyElementIsClose,
           "every logit is inside the elementwise bound");
 }

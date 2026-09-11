@@ -11,11 +11,17 @@
 // would make every comparison built on it meaningless in a way that reads as
 // our bug — so the shape of what LlamaOracle hands back is asserted here, and
 // one end-to-end claim about the model's behaviour with it: greedy decoding
-// from "The capital of France is" reaches Paris.
+// from a question about the capital of France reaches Paris.
 //
-// Everything skips without gemma-2b.gguf, which comes with Google's own gated
-// download rather than with the mirror the build fetches — GEMMA_MODEL_DIR is
-// how a machine that has done that download names it.
+// The prompt is the one Tests/Generation probes with, for the reason given
+// there: greedy gemma-2b continues "The capital of France is" with " a city of
+// contrasts" rather than with Paris, and this oracle is one of the three
+// witnesses that say so.
+//
+// Everything skips without gemma-2b.gguf. It is not in the mirror the build
+// fetches and no longer needs Google's gated repo either: convert_hf_to_gguf.py
+// out of the pinned llama.cpp tree makes it from the fetched safetensors, and
+// GEMMA_MODEL_DIR names the directory it was written to.
 
 using namespace nano;
 using namespace HF;
@@ -23,7 +29,8 @@ using namespace HF::Testing;
 
 namespace
 {
-constexpr auto capitalPrompt = std::string_view {"The capital of France is"};
+constexpr auto capitalPrompt =
+    std::string_view {"Q: What is the capital of France?\nA:"};
 constexpr auto greedySteps = 8;
 
 bool canRun()

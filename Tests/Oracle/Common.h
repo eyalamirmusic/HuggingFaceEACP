@@ -4,12 +4,14 @@
 // load: llama.cpp over gemma-2b.gguf on one side, our own modules over the
 // files beside it on the other.
 //
-// The GGUF is a 10 GB manual download and the one file the fetched mirror does
-// not carry — it comes with Google's own gated repo, which GEMMA_MODEL_DIR is
-// how a machine that has done that download names. So on a machine without one
-// every test here returns early, the same shape as a GPU test returning early
-// when Device::shared().isValid() is false. The skip says so once rather than
-// per test, because a silent pass and a real pass look alike.
+// The GGUF is 10 GB and the one file the fetched mirror does not carry, but it
+// no longer takes Google's gated repo either: convert_hf_to_gguf.py out of the
+// llama.cpp tree this build already pins converts the fetched safetensors into
+// one, and GEMMA_MODEL_DIR names where it was written. So on a machine that
+// has not done that every test here returns early, the same shape as a GPU
+// test returning early when Device::shared().isValid() is false. The skip says
+// so once rather than per test, because a silent pass and a real pass look
+// alike.
 
 #include "LlamaOracle.h"
 
@@ -55,9 +57,10 @@ inline void announceSkip()
     {
         std::cout << "  no " << ModelFileNames::ggufModel << " in "
                   << gemmaModelDirectory().string()
-                  << ": the llama.cpp oracle tests skip. It comes with Google's "
-                     "own gated download, which "
-                  << modelDirectoryVariable << " points at\n";
+                  << ": the llama.cpp oracle tests skip. convert_hf_to_gguf.py in "
+                     "the pinned llama.cpp tree writes one from the fetched "
+                     "safetensors at --outtype f32, and "
+                  << modelDirectoryVariable << " points at where it went\n";
 
         return true;
     }();

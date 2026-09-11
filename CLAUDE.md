@@ -28,8 +28,10 @@ weights are a build-time download rather than something to arrange by hand:
 `HF_EACP_FETCH_MODEL` fetches gemma-2b at configure time and
 `hf_bundle_model(<target>)` copies it beside a binary, which `Generate` and
 `Tests/Bundled` both call. `GEMMA_MODEL_DIR` is the explicit override, for a
-checkpoint of your own — Google's gated download among them, which is the one
-that carries the `gemma-2b.gguf` `Tests/Oracle` reads.
+checkpoint of your own, and is also what points `Tests/Oracle` at the
+`gemma-2b.gguf` it reads — the one file the fetch does not carry, and one the
+pinned llama.cpp tree's own converter writes from the fetched safetensors
+rather than something to download.
 
 ## Build Commands
 
@@ -70,8 +72,8 @@ ctest --test-dir build --output-on-failure
   any file in it answers HTTP 401 and CPM cannot fetch it. unsloth's is an
   ungated mirror of the same bf16 weights — one unsharded `model.safetensors`,
   the same tokenizer, the same config numbers. What it does not carry is
-  `gemma-2b.gguf`, so `Tests/Oracle` still wants Google's own download through
-  `GEMMA_MODEL_DIR`.
+  `gemma-2b.gguf`, which `Tests/Oracle` reads and which the conversion under
+  `HF_EACP_ENABLE_LLAMA_CPP` below produces from these same files.
 
   It costs disk twice over. The download itself is 5.0 GB of
   `model.safetensors` plus 17.5 MB of `tokenizer.json` and under a kilobyte of
@@ -88,10 +90,9 @@ ctest --test-dir build --output-on-failure
   release tag and builds `Tests/Oracle`, which compares our tokens and our
   logits against it. Off by default because both halves are expensive in a way
   the rest of this build is not — llama.cpp and ggml are minutes of compile,
-  and the `gemma-2b.gguf` the tests read is a 10 GB manual download that the
-  fetched mirror does not carry, so it takes `GEMMA_MODEL_DIR` pointing at
-  Google's own gated download and every test there skips without one. It means
-  nothing without
+  and the `gemma-2b.gguf` the tests read is 10 GB the fetched mirror does not
+  carry, so every test there skips until `GEMMA_MODEL_DIR` names a directory
+  holding one. It means nothing without
   `HF_EACP_ENABLE_TESTS`. The fetch names every ggml backend off, so the
   reference is exactly ggml's CPU arithmetic and a disagreement cannot be a
   backend's.
@@ -100,6 +101,24 @@ ctest --test-dir build --output-on-failure
   cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DHF_EACP_UNITY_BUILD=OFF \
         -DHF_EACP_ENABLE_LLAMA_CPP=ON
   ```
+
+  The GGUF is **made, not downloaded**: Google's gated repo is no longer needed
+  for anything. The pinned llama.cpp tree's own converter writes one from the
+  same safetensors the build fetches, and `GEMMA_MODEL_DIR` then points at
+  where it went.
+
+  ```bash
+  build/_deps/llama-cpp-src/convert_hf_to_gguf.py <staged> --outtype f32 \
+        --outfile $HOME/Code/models/gemma-2b/gemma-2b.gguf
+  ```
+
+  `<staged>` is a directory holding the four fetched files plus the three the
+  converter reads and the fetch does not take — `tokenizer.model`,
+  `tokenizer_config.json` and `special_tokens_map.json`, from the same pinned
+  `unsloth/gemma-2b` commit. It needs a Python environment with `torch`, writes
+  10 GB of F32, and omits `gemma.rope.freq_base`, which is why
+  `Oracle/Decoder/configMatchesGguf` reports `rope_theta` rather than asserting
+  it.
 
 - `HF_EACP_CI_BUILD` (default `OFF`): turns on the unity builds here and in eacp
   and Miro. There is no CI (see below); the switch is what makes that

@@ -11,11 +11,21 @@
 // all do without a device.
 //
 // This is the first test in the tree that asserts something about what the
-// model *says* rather than about a number: a base completion model given "The
-// capital of France is" continues with " Paris", and it is the one assertion
-// that fails if the loader, the tokenizer, the eighteen layers, the KV cache
-// and the greedy search are each nearly right. The tiers below it are what say
+// model *says* rather than about a number: a base completion model asked for
+// the capital of France answers " Paris", and it is the one assertion that
+// fails if the loader, the tokenizer, the eighteen layers, the KV cache and
+// the greedy search are each nearly right. The tiers below it are what say
 // which of them it was.
+//
+// The prompt is a question because "The capital of France is" is not one this
+// model answers: greedy gemma-2b continues that with " a city of contrasts",
+// and it is right to — ' a' beats ' Paris' there by 0.326 logits, which
+// llama.cpp over the F32 GGUF and Hugging Face transformers in fp32 both agree
+// with token for token. An assertion on a 0.326-logit margin measures which
+// side of a near-tie a rounding landed on. The question form puts ' Paris'
+// 4.89 logits clear of the runner-up, which is a hundred times the largest
+// disagreement Tests/Oracle has ever measured between our logits and
+// llama.cpp's, so what it measures is our arithmetic.
 
 using namespace nano;
 using namespace HF;
@@ -28,6 +38,10 @@ bool hasRealCheckpoint()
 {
     return Device::shared().isValid() && hasGemmaModel();
 }
+
+// The probe: the answer is the very first token greedy takes, and the note at
+// the top is why it is this prompt rather than a bare completion.
+constexpr auto parisPrompt = "Q: What is the capital of France?\nA:";
 
 // Small enough that a first run is seconds rather than a minute, and long
 // enough that a continuation has somewhere to put the word.
@@ -72,12 +86,12 @@ auto tGemmaGeneratesText = test("Generation/Gemma/completesAPrompt") = []
     auto streamed = Vector<TokenId> {};
     gemma.onToken = [&streamed](TokenId token) { streamed.add(token); };
 
-    const auto text = gemma.generateText("The capital of France is");
+    const auto text = gemma.generateText(parisPrompt);
 
     check(streamed.size() > 0);
     check(streamed.size() <= smokeTokens);
 
-    std::cout << "  \"The capital of France is\" ->\"" << text << "\"\n";
+    std::cout << "  \"" << parisPrompt << "\" ->\"" << text << "\"\n";
     reportTimings(gemma, streamed.size());
 
     check(text.find("Paris") != std::string::npos);
@@ -98,11 +112,11 @@ auto tGemmaSampledPathAgrees = test("Generation/Gemma/sampledPathAgrees") = []
 
     gemma.setMaximumTokens(4);
 
-    const auto greedy = gemma.generateFromText("The capital of France is");
+    const auto greedy = gemma.generateFromText(parisPrompt);
 
     gemma.setSampling(SamplingOptions {.temperature = 1.0e-3f, .topK = 1});
 
-    const auto sampled = gemma.generateFromText("The capital of France is");
+    const auto sampled = gemma.generateFromText(parisPrompt);
 
     check(sameTokens(greedy, sampled));
 

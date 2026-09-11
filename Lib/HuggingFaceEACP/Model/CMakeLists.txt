@@ -43,11 +43,10 @@ set(HF_EACP_GEMMA_MODEL_DIR "${CMAKE_BINARY_DIR}/gemma-2b"
 # tokenizer, the same config numbers — and pinning the revision is what keeps
 # the hashes below valid when the mirror moves.
 #
-# Google's own download is still reachable, through the GEMMA_MODEL_DIR
-# override that ModelFiles.h documents. That is the one that carries
-# gemma-2b.gguf beside the safetensors, which is what Tests/Oracle reads, so a
-# machine that has done the gated download by hand keeps every test the mirror
-# cannot serve.
+# The one file the mirror cannot serve is gemma-2b.gguf, which Tests/Oracle
+# reads. It is not a download at all any more: llama.cpp's own converter writes
+# it from the files fetched here, and the GEMMA_MODEL_DIR override that
+# ModelFiles.h documents is how a machine that has run that says where it went.
 set(GEMMA_2B_URL "https://huggingface.co/unsloth/gemma-2b/resolve/\
 7ac9d201a57c8cdc6f939069fc0f044c60197a4a")
 
