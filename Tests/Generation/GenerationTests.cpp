@@ -543,3 +543,54 @@ auto tGenerationRefusesTheImpossible = test("Generation/refusesTheImpossible") =
 
     check(throwsModelError([&] { gemma.setPromptCapacity(0); }));
 };
+
+// The loop on the quantized path, against the same loop this suite runs itself
+// over weights the loader quantized the same way. Nothing about the run changes
+// but setWeightPrecision, which is the claim: a caller trades bytes for
+// accuracy and gets the same machinery.
+//
+// The feed-forward width is 64 rather than the suite's 48, because 48 is not a
+// whole number of blocks and the loader refuses it — see
+// smallQuantizableGemmaConfig.
+auto tInt8GreedyMatchesReference =
+    test("Generation/int8GreedyMatchesAReferenceLoop") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto model = SyntheticModel {"generation-int8",
+                                       [](Vector<SyntheticTensor>&) {},
+                                       smallQuantizableGemmaConfig()};
+
+    const auto prompt = promptTokens();
+
+    auto gemma = Gemma {};
+    gemma.load(model.path());
+    gemma.setPromptCapacity(16);
+    gemma.setWeightPrecision(WeightPrecision::Int8Blocks);
+    gemma.prepare();
+
+    const auto limit = 6;
+    gemma.setMaximumTokens(limit);
+
+    const auto promptIds = asTokens(prompt);
+    const auto generated = gemma.generate(promptIds);
+
+    const auto storages = gemma.weightStorages();
+
+    check(storages.size() == 1);
+    check(storages[0] == WeightStorage::Int8Blocks);
+    check(gemma.weightPrecision() == WeightPrecision::Int8Blocks);
+
+    const auto expected = referenceGenerate(model.checkpoint(),
+                                            gemma.shape(),
+                                            prompt,
+                                            limit,
+                                            gemma.config().endOfSequenceToken,
+                                            WeightPrecision::Int8Blocks);
+
+    check(sameTokens(generated, expected.tokens));
+    check(generated.size() > 0);
+
+    std::cout << "  int8 greedy: " << tokenList(generated) << "\n";
+};

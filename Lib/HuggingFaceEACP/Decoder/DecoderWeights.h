@@ -1,11 +1,11 @@
 #pragma once
 
 #include <HuggingFaceEACP/Decoder/DecoderShape.h>
-#include <HuggingFaceEACP/Model/ShardedTensors.h>
+#include <HuggingFaceEACP/Model/TensorLoader.h>
 
 namespace HF
 {
-// Which of the three product programs a buffer is readable by. The loader
+// Which of the four product programs a buffer is readable by. The loader
 // decided it when it uploaded the tensor, and nothing about a GPU::Buffer
 // carries it, which is why TensorBuffer holds the buffer and its storage
 // together.
@@ -38,6 +38,14 @@ WeightStorage weightStorageOf(const TensorBuffer& weight);
 // which is stacked as raw bytes rather than concatenated through readFloats, so
 // a packed pair stays packed — see TensorLoader::loadStackedProjectionWeights.
 //
+// **Or quantized, when the caller asks.** WeightPrecision::Int8Blocks makes
+// every one of those tensors on the way up instead of taking it as it lies:
+// thirty-two elements to a block, one fp16 scale each, 1.0625 bytes an element
+// against bf16's two. The precision is the caller's because it is a trade
+// rather than a fact about the checkpoint — bytes per token against a little
+// accuracy per element — and AsShipped stays the default so nothing changes for
+// a caller that has not asked.
+//
 // **The two norm scales are the exception, and are widened to F32.** They are
 // [width] each, 8 kB a layer, and the alternative is a packed read in RMSNorm
 // for a tensor whose bytes are a rounding error against the projections beside
@@ -46,7 +54,8 @@ struct DecoderLayerWeights
 {
     DecoderLayerWeights(const ShardedTensors& file,
                         const DecoderShape& shape,
-                        int index);
+                        int index,
+                        WeightPrecision precision = WeightPrecision::AsShipped);
 
     TensorBuffer inputNorm;
     TensorBuffer query;
@@ -79,12 +88,14 @@ struct DecoderLayerWeights
 // subscript.
 struct DecoderWeights
 {
-    DecoderWeights(const ShardedTensors& file, const DecoderShape& shapeToUse);
+    DecoderWeights(const ShardedTensors& file,
+                   const DecoderShape& shapeToUse,
+                   WeightPrecision precision = WeightPrecision::AsShipped);
 
     // Every distinct storage the weights above a product or the gather reads
     // are in, which for a real checkpoint is one entry. Decoder::prepare
-    // compiles the programs these name and no others — three storages times a
-    // tiled product, two split products and a gather is twelve pipelines, of
+    // compiles the programs these name and no others — four storages times a
+    // tiled product, two split products and a gather is sixteen pipelines, of
     // which a run dispatches four.
     //
     // The norm scales are not in here. They are widened to F32 on the way up

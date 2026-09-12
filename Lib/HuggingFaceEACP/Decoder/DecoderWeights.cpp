@@ -35,47 +35,57 @@ const DecoderShape& validated(const DecoderShape& shape)
 }
 
 TensorBuffer loadTokenEmbedding(const ShardedTensors& file,
-                                const DecoderShape& shape)
+                                const DecoderShape& shape,
+                                WeightPrecision precision)
 {
     return decoderTensors(file).loadProjectionWeight(
-        GemmaTensors::embedding, {shape.vocabularySize, shape.width});
+        GemmaTensors::embedding, {shape.vocabularySize, shape.width}, precision);
 }
 
 // gate_proj and up_proj stacked into the one [2 * intermediate, width] weight
 // the feed-forward's single product reads, gate rows first — which is the
 // halving of a row GeGLU's primary form is written against.
-TensorBuffer
-    loadFusedGateUp(const ShardedTensors& file, const DecoderShape& shape, int index)
+TensorBuffer loadFusedGateUp(const ShardedTensors& file,
+                             const DecoderShape& shape,
+                             int index,
+                             WeightPrecision precision)
 {
     return TensorLoader {file, layerComponent(index)}.loadStackedProjectionWeights(
         GemmaTensors::layerTensorName(index, GemmaTensors::gateProjection),
         GemmaTensors::layerTensorName(index, GemmaTensors::upProjection),
-        {shape.intermediate, shape.width});
+        {shape.intermediate, shape.width},
+        precision);
 }
 } // namespace
 
 DecoderLayerWeights::DecoderLayerWeights(const ShardedTensors& file,
                                          const DecoderShape& shape,
-                                         int index)
+                                         int index,
+                                         WeightPrecision precision)
     : inputNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::inputNorm),
           {shape.width}))
     , query(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::queryProjection),
-          {shape.queryWidth(), shape.width}))
+          {shape.queryWidth(), shape.width},
+          precision))
     , key(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::keyProjection),
-          {shape.kvWidth(), shape.width}))
+          {shape.kvWidth(), shape.width},
+          precision))
     , value(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::valueProjection),
-          {shape.kvWidth(), shape.width}))
+          {shape.kvWidth(), shape.width},
+          precision))
     , output(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::outputProjection),
-          {shape.width, shape.queryWidth()}))
-    , fusedGateUp(loadFusedGateUp(file, shape, index))
+          {shape.width, shape.queryWidth()},
+          precision))
+    , fusedGateUp(loadFusedGateUp(file, shape, index, precision))
     , down(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::downProjection),
-          {shape.width, shape.intermediate}))
+          {shape.width, shape.intermediate},
+          precision))
     , postAttentionNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::postAttentionNorm),
           {shape.width}))
@@ -84,6 +94,9 @@ DecoderLayerWeights::DecoderLayerWeights(const ShardedTensors& file,
 
 WeightStorage weightStorageOf(const TensorBuffer& weight)
 {
+    if (weight.isInt8Blocks())
+        return WeightStorage::Int8Blocks;
+
     if (weight.isPackedHalf())
         return WeightStorage::PackedHalf;
 
@@ -94,16 +107,17 @@ WeightStorage weightStorageOf(const TensorBuffer& weight)
 }
 
 DecoderWeights::DecoderWeights(const ShardedTensors& file,
-                               const DecoderShape& shapeToUse)
+                               const DecoderShape& shapeToUse,
+                               WeightPrecision precision)
     : shape(validated(shapeToUse))
-    , tokenEmbedding(loadTokenEmbedding(file, shapeToUse))
+    , tokenEmbedding(loadTokenEmbedding(file, shapeToUse, precision))
     , finalNorm(decoderTensors(file).loadFloatTensor(GemmaTensors::finalNorm,
                                                      {shapeToUse.width}))
 {
     layers.reserve(shapeToUse.layers);
 
     for (auto index = 0; index < shapeToUse.layers; ++index)
-        layers.emplace_back(file, shapeToUse, index);
+        layers.emplace_back(file, shapeToUse, index, precision);
 }
 
 Vector<WeightStorage> DecoderWeights::storages() const

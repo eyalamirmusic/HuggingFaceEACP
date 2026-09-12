@@ -33,6 +33,15 @@ checkpoint of your own, and is also what points `Tests/Oracle` at the
 pinned llama.cpp tree's own converter writes from the fetched safetensors
 rather than something to download.
 
+Weights go up in whatever the checkpoint ships them in, which for gemma-2b is
+bf16 kept packed. `Gemma::setWeightPrecision(WeightPrecision::Int8Blocks)` —
+`Generate`'s `--int8` — quantizes them on the way up instead, thirty-two
+elements to a block against one fp16 scale, 2.66 GB of weights a decode step
+rather than 5.0 and 141 decode tokens/s rather than 86. It is the caller's
+choice and not the default: the argmax has not moved on any row the oracle
+compares, and the elementwise logit differences are a hundred times larger.
+Step 5 of `plan.md` is the measurement, both halves of it.
+
 ## Build Commands
 
 ```bash
@@ -222,12 +231,12 @@ runs against MSL on Apple and HLSL on Windows.
 | `Lib/HuggingFaceEACP/Core` | Shared types and the library version. Links `eacp-gpu` |
 | `Lib/HuggingFaceEACP/Model` | Safetensors with the shard index, `config.json`, the tensor catalogue, the `GEMMA_MODEL_DIR` override, and the model fetch with `hf_bundle_model` |
 | `Lib/HuggingFaceEACP/Tokenizer` | Gemma's SentencePiece-style BPE from `tokenizer.json`, with byte fallback |
-| `Lib/HuggingFaceEACP/Kernels` | The op set: the products, the reductions, RMSNorm, RoPE, GeGLU and the multi-query attention |
+| `Lib/HuggingFaceEACP/Kernels` | The op set: the products, the reductions, RMSNorm, RoPE, GeGLU and the multi-query attention, over the four weight storages `WeightStorage.h` names — `Int8Blocks.h` is the block-quantized one, the layout the loader writes and the products read |
 | `Lib/HuggingFaceEACP/Decoder` | Gemma's forward pass over a KV cache: the shape, the weights, and one compute pass per step |
 | `Lib/HuggingFaceEACP/Sampling` | The CPU sampler over a read-back logits row: greedy, temperature, top-k, top-p |
 | `Lib/HuggingFaceEACP/Generation` | `Gemma`: the whole runtime, a string in and a string out, with the greedy loop's token feedback on the device; and `resourcesDirectory()`, which finds the model the build copied |
 | `Apps/Console/DeviceInfo` | What this machine's GPU offers, printed from eacp's `Device` |
-| `Apps/Console/Generate` | A prompt in and a continuation streamed out, over the model the build copied beside it, or the one `GEMMA_MODEL_DIR` names |
+| `Apps/Console/Generate` | A prompt in and a continuation streamed out, over the model the build copied beside it, or the one `GEMMA_MODEL_DIR` names. `--int8` quantizes the weights at load: 2.66 GB a decode step rather than 5.0, and 141 tokens/s rather than 87 |
 | `Tests/Core` | The version, without a device |
 | `Tests/Bundled` | What `hf_bundle_model` put beside the binary: the copy matches the fetch, and a run out of it generates |
 | `Tests/GPU` | The compute smoke test: eacp's toolchain end to end |

@@ -114,6 +114,31 @@ auto tSimdTiledLinearBFloat16Weights =
         128, 64, 128, 420u, TiledProduct::packedBFloat16s);
 };
 
+// The quantized form through the SIMD-group matrix, which is the product a
+// prefill takes on Metal: the fragment still loads fp32 out of threadgroup
+// memory, so what changes is only how the staging thread got the value it put
+// there — eight bytes and the one block scale they share, out of a single
+// readInt8x8, rather than eight widened bf16s.
+auto tSimdTiledLinearInt8Weights = test("Kernels/simdTiledLinearInt8Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        37, 32, 34, 430u, TiledProduct::quantizedInt8Blocks);
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        100, 64, 76, 440u, TiledProduct::quantizedInt8Blocks);
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        128, 128, 128, 450u, TiledProduct::quantizedInt8Blocks);
+
+    // A prefix of each row, so a staging run of eight straddles the inner
+    // extent and the wide quantized read gives way to the loop beside it.
+    TiledProduct::checkPackedLinearOverPrefix<Int8WeightSimdTiledLinear>(
+        100, 40, 64, 76, 460u, TiledProduct::quantizedInt8Blocks);
+};
+
 // The batch fold and the causal mask together: one batch per head over the
 // head's slice of rows the batch strides address, and a trapezoid whose masked
 // count is asserted rather than only its values.

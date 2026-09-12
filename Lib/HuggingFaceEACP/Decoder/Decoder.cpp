@@ -248,6 +248,18 @@ void Decoder::prepareStorage(Device& device, WeightStorage storage)
         return;
     }
 
+    if (storage == WeightStorage::Int8Blocks)
+    {
+        prepareVariant(device,
+                       int8Embedding,
+                       int8Product,
+                       int8SplitProjection,
+                       int8SplitLogits,
+                       stepSplitCount,
+                       logitsSplitCount);
+        return;
+    }
+
     prepareVariant(device,
                    embedding,
                    product,
@@ -264,6 +276,9 @@ bool Decoder::isPrepared(WeightStorage storage) const
 
     if (storage == WeightStorage::PackedBFloat16)
         return bfloatProduct.has_value();
+
+    if (storage == WeightStorage::Int8Blocks)
+        return int8Product.has_value();
 
     return product.has_value();
 }
@@ -314,6 +329,15 @@ void Decoder::encodeEmbed(ComputePass& pass,
         program.width = (std::uint32_t) decoderShape.width;
         program.scale = decoderShape.embeddingScale;
 
+        // Where a quantized table's per-block scales begin, in halves — see
+        // EmbedProgram::blockScales for why the gather is the one kernel told
+        // rather than the one that works it out. Set whatever the storage is,
+        // since only the quantized gather reads it and a branch here would say
+        // less than the number does.
+        program.blockScales =
+            (std::uint32_t) ((std::int64_t) decoderShape.vocabularySize
+                             * decoderShape.width / 2);
+
         pass.dispatch(program, decoderShape.width, tokenCount);
     };
 
@@ -325,6 +349,10 @@ void Decoder::encodeEmbed(ComputePass& pass,
 
         case WeightStorage::PackedBFloat16:
             dispatchThrough(*bfloatEmbedding);
+            return;
+
+        case WeightStorage::Int8Blocks:
+            dispatchThrough(*int8Embedding);
             return;
 
         case WeightStorage::Float:
@@ -407,6 +435,10 @@ void Decoder::encodeProduct(ComputePass& pass,
         case WeightStorage::PackedBFloat16:
             dispatchOneOf(
                 *bfloatProduct, *bfloatSplitProjection, *bfloatSplitLogits);
+            return;
+
+        case WeightStorage::Int8Blocks:
+            dispatchOneOf(*int8Product, *int8SplitProjection, *int8SplitLogits);
             return;
 
         case WeightStorage::Float:

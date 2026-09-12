@@ -53,14 +53,15 @@ namespace HF
 // top-p onto the device is a later round; the tokens are the same either way,
 // which is what the tests over the two paths say.
 //
-// **Memory.** Gemma's weights are BF16 and stay BF16: every product and the
-// embedding gather read them through eacp's readBFloat16, so the device holds
-// about 5 GB of them rather than the 10 GB a widened copy cost, with the
+// **Memory.** Gemma's weights are BF16 and stay BF16 by default: every product
+// and the embedding gather read them through eacp's readBFloat16, so the device
+// holds about 5 GB of them rather than the 10 GB a widened copy cost, with the
 // 1.05 GB embedding bound twice — once as the gather's table and once as the
-// tied logits projection. On top of that the logits buffer is promptCapacity()
-// rows of the vocabulary, 524 MB at the default 512 rows, and it is now the
-// largest single allocation here after the embedding, as well as the one buffer
-// that scales with that setting.
+// tied logits projection. setWeightPrecision takes that to 2.7 GB by quantizing
+// them into int8 blocks at load. On top of that the logits buffer is
+// promptCapacity() rows of the vocabulary, 524 MB at the default 512 rows, and
+// it is now the largest single allocation here after the embedding, as well as
+// the one buffer that scales with that setting.
 class Gemma
 {
 public:
@@ -149,6 +150,23 @@ public:
     int promptCapacity() const { return promptRowCapacity; }
     void setPromptCapacity(int rows);
 
+    // What the product weights go to the device as: the checkpoint's own bytes,
+    // which is the default and what every run did before there was a choice, or
+    // quantized into int8 blocks on the way up.
+    //
+    // A trade rather than a fact about the checkpoint — a decode step reads
+    // every weight once, so 1.0625 bytes an element against bf16's two is the
+    // step's whole cost halved, and what it costs is a little accuracy per
+    // element. Set it before prepare(), which is where the weights are read,
+    // the way the prompt capacity is set before the sizes are taken.
+    WeightPrecision weightPrecision() const { return precision; }
+    void setWeightPrecision(WeightPrecision toUse);
+
+    // Every distinct storage a prepared run's weights are in, which for a real
+    // checkpoint is one entry — what the weights actually became, as against
+    // what was asked for. Empty before prepare().
+    Vector<WeightStorage> weightStorages() const;
+
     // Greedy by default, which is the fast path: temperature zero is the
     // on-device Argmax and never reads a logits row back.
     //
@@ -218,6 +236,18 @@ public:
     // that an ordinary prompt is one block and takes the many-row tiled
     // product, small enough that the logits buffer behind it is half a gigabyte
     // rather than eight.
+    //
+    // **512 is where the two curves cross, and both halves of that are
+    // measured.** Over a 986-token prompt in Release, which is two blocks at
+    // this capacity and eight at the smallest tried, the prefill takes 0.79 s
+    // at 128 rows, 0.76 s at 256, 0.69 s at 512 and 0.69 s at 1024 — so a
+    // smaller block costs 10% of the prefill at 256 and 15% at 128, and a
+    // larger one buys nothing, since 512 rows already fill the tiled product's
+    // machine. The process peaks at 5.48, 5.63, 5.94 and 6.54 GB across the
+    // same four, which is the logits buffer at 131, 262, 524 and 1049 MB plus
+    // the per-step intermediates beside it. Half a gigabyte for the last 15% of
+    // the prefill is the trade this takes; a caller who wants the memory back
+    // sets a smaller capacity and knows what it costs.
     static constexpr int defaultPromptCapacity = 512;
 
 private:
@@ -287,6 +317,7 @@ private:
     SamplingOptions samplingOptions = SamplingOptions::greedy();
     int maximumTokenCount = 0;
     int promptRowCapacity = defaultPromptCapacity;
+    WeightPrecision precision = WeightPrecision::AsShipped;
 
     // One float per vocabulary entry, nonzero at a token that may not be
     // chosen, in the layout Argmax's mask buffer has and Sampler::sample reads.

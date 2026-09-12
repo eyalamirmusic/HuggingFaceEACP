@@ -207,6 +207,50 @@ auto tBFloat16WeightEmbedMatchesCpu =
         check(isClose(result[i], expected[i], 1e-6));
 };
 
+// The quantized table, which is the tied embedding once the loader has
+// quantized the checkpoint. The gather is the one kernel told where its scales
+// begin rather than working it out — see EmbedProgram::blockScales — so this is
+// as much about that uniform as about the byte read: a gather that ignored it
+// would read a scale out of the quantized bytes and produce numbers.
+//
+// A width of 32 is one whole block to a row, which is what the format asks of
+// the contiguous dimension; the vocabulary is 14 so the table is a whole number
+// of scale words.
+auto tInt8WeightEmbedMatchesCpu = test("Kernels/int8WeightEmbedMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto width = 32;
+    constexpr auto smallVocabulary = 14;
+
+    auto tokens = tokensOf({7, 0, 13, 3, 3, 11});
+    auto values = spreadValues(smallVocabulary * width, 4343u, 2.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto tokenBuffer = storageOf(tokens);
+    auto tableBuffer = storageOf(packed);
+    auto output = outputFor(tokens.size() * width);
+
+    auto kernel = Int8WeightEmbed {};
+    kernel.tokens = tokenBuffer;
+    kernel.tokenTable = tableBuffer;
+    kernel.output = output;
+    kernel.width = (unsigned) width;
+    kernel.scale = gemmaScale;
+    kernel.blockScales = (unsigned) (smallVocabulary * width / 2);
+
+    auto result = runOverGrid(kernel, output, width, tokens.size());
+    auto expected = embedReference(tokens, widened, width, gemmaScale);
+
+    check(result.size() == expected.size());
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-6));
+};
+
 // The shape a decode step has: one token, the model's own width, through the
 // same pipeline the prompt's many rows went through.
 auto tEmbedOneRowAtModelWidth = test("Kernels/embedOneRowAtModelWidth") = []

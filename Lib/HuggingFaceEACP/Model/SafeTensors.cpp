@@ -70,14 +70,13 @@ float bfloatToFloat(std::uint16_t bits)
 }
 
 template <typename Element, typename Widen>
-void widenEach(Span<const std::uint8_t> source, Span<float> destination, Widen widen)
+void widenEach(const std::uint8_t* source, Span<float> destination, Widen widen)
 {
     for (auto index = 0; index < destination.size(); ++index)
     {
         auto element = Element {};
         std::memcpy(&element,
-                    source.data()
-                        + static_cast<std::size_t>(index) * sizeof(Element),
+                    source + static_cast<std::size_t>(index) * sizeof(Element),
                     sizeof(Element));
 
         destination[index] = widen(element);
@@ -88,34 +87,7 @@ void widenToFloat(const TensorInfo& tensor,
                   Span<const std::uint8_t> source,
                   Span<float> destination)
 {
-    switch (tensor.type)
-    {
-        case TensorType::F32:
-            std::memcpy(destination.data(),
-                        source.data(),
-                        static_cast<std::size_t>(source.size()));
-            return;
-
-        case TensorType::F16:
-            widenEach<std::uint16_t>(source, destination, halfToFloat);
-            return;
-
-        case TensorType::BF16:
-            widenEach<std::uint16_t>(source, destination, bfloatToFloat);
-            return;
-
-        case TensorType::F64:
-            widenEach<double>(source,
-                              destination,
-                              [](double value)
-                              { return static_cast<float>(value); });
-            return;
-
-        default:
-            throw ModelError {"tensor '" + tensor.name + "' has type "
-                              + std::string {tensorTypeName(tensor.type)}
-                              + ", which is not a float type"};
-    }
+    widenTensorElements(tensor, source, 0, destination);
 }
 
 Vector<std::int64_t> parseShape(const Miro::Json::Object& entry,
@@ -266,6 +238,46 @@ std::map<std::string, std::string> parseMetadata(const Miro::Json::Value& value)
     return metadata;
 }
 } // namespace
+
+void widenTensorElements(const TensorInfo& tensor,
+                         Span<const std::uint8_t> bytes,
+                         std::int64_t first,
+                         Span<float> destination)
+{
+    const auto* source =
+        bytes.data()
+        + static_cast<std::size_t>(first * bytesPerElement(tensor.type));
+
+    switch (tensor.type)
+    {
+        case TensorType::F32:
+            std::memcpy(destination.data(),
+                        source,
+                        sizeof(float)
+                            * static_cast<std::size_t>(destination.size()));
+            return;
+
+        case TensorType::F16:
+            widenEach<std::uint16_t>(source, destination, halfToFloat);
+            return;
+
+        case TensorType::BF16:
+            widenEach<std::uint16_t>(source, destination, bfloatToFloat);
+            return;
+
+        case TensorType::F64:
+            widenEach<double>(source,
+                              destination,
+                              [](double value)
+                              { return static_cast<float>(value); });
+            return;
+
+        default:
+            throw ModelError {"tensor '" + tensor.name + "' has type "
+                              + std::string {tensorTypeName(tensor.type)}
+                              + ", which is not a float type"};
+    }
+}
 
 std::int64_t TensorInfo::elementCount() const
 {

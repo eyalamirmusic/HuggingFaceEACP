@@ -127,6 +127,50 @@ auto tPackedWeightMatMulMatchesCpu =
     checkPacked(bfloat, TiledProduct::packedBFloat16s);
 };
 
+// The quantized weight through the same product, at a shape the block format
+// takes: B is [innerCount, columnCount] here, so the contiguous dimension the
+// blocks run along is the column count rather than the inner extent — which is
+// the whole of what the format asks, since a block is thirty-two stored
+// elements and the kernel finds one by dividing an index.
+//
+// The reference runs on the dequantized weights, so what this checks is the
+// shader's byte read and its scale, not the format's accuracy.
+auto tInt8WeightMatMulMatchesCpu = test("Kernels/int8WeightMatMulMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 5;
+    constexpr auto columns = 64;
+    constexpr auto rows = 3;
+
+    auto a = spreadValues(rows * inner, 606060u, 2.f);
+    auto bias = spreadValues(columns, 707070u, 1.f);
+    auto values = spreadValues(inner * columns, 808080u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto aBuffer = storageOf(a);
+    auto bBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * columns);
+
+    auto kernel = Int8WeightMatMul {};
+    kernel.a = aBuffer;
+    kernel.b = bBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.columnCount = (unsigned) columns;
+
+    auto result = runOverGrid(kernel, output, columns, rows);
+    auto expected = matMulReference(a, widened, bias, rows, inner, columns);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
+};
+
 // A shape wide enough that a thread reaching one element past its row, or an
 // accumulator that never got reset between output elements, shows up as a
 // number rather than as a crash — and with the zero bias every Gemma

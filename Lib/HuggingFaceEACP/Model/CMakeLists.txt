@@ -2,7 +2,12 @@ add_library(hf-model STATIC)
 
 # Miro rides along on eacp-core, which hf-core links through eacp-gpu, so
 # <Miro/Json.h> needs no dependency of its own here.
-target_link_libraries(hf-model PUBLIC hf-core)
+#
+# hf-kernels is PRIVATE and is one function: Kernels/Int8Blocks.h is where the
+# quantized layout is defined, because it is defined by the read that consumes
+# it, and TensorLoader writes that layout. Nothing in this module's own
+# signatures names a kernel.
+target_link_libraries(hf-model PUBLIC hf-core PRIVATE hf-kernels)
 
 target_sources(hf-model PRIVATE
         GemmaConfig.cpp

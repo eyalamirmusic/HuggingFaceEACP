@@ -50,7 +50,15 @@ struct MatMulProgram final : ComputeProgram
         write(output, row * columnCount + column, total.get() + bias[column]);
     }
 
-    Float weight(const UInt& index) { return storedWeight<weightStorage>(b, index); }
+    Float weight(const UInt& index)
+    {
+        return storedWeight<weightStorage>(b, index, scaleBase());
+    }
+
+    // Where B's per-block scales begin, in halves: past its innerCount *
+    // columnCount elements, both of which are already uniforms. Read by the
+    // quantized storage alone — see storedWeight.
+    UInt scaleBase() { return innerCount * columnCount / 2u; }
 
     Uniform<InputBuffer> a;
     Uniform<InputBuffer> b;
@@ -65,4 +73,5 @@ struct MatMulProgram final : ComputeProgram
 using MatMul = MatMulProgram<WeightStorage::Float>;
 using HalfWeightMatMul = MatMulProgram<WeightStorage::PackedHalf>;
 using BFloat16WeightMatMul = MatMulProgram<WeightStorage::PackedBFloat16>;
+using Int8WeightMatMul = MatMulProgram<WeightStorage::Int8Blocks>;
 } // namespace HF

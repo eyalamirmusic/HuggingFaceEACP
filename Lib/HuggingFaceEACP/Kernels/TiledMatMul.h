@@ -298,16 +298,21 @@ struct TiledMatMulProgram final : ComputeProgram
                  if constexpr (bLayout == OperandLayout::ContiguousK)
                  {
                      auto bRow = bBase + min(n0 + lane, columnCount - 1u) * bStride;
+                     auto run = bRow + k0.get() + half;
 
-                     for (auto i = 0u; i < 8u; ++i)
-                     {
-                         auto k = k0.get() + half + i;
-                         auto value = select(k < innerCount,
-                                             weight(bRow + min(k, innerCount - 1u)),
-                                             0.f);
+                     stageWeightRun(
+                         run,
+                         k0.get() + half + 8u <= innerCount,
+                         [&](unsigned i, const Float& value)
+                         { write(bTile, (half + i) * tileWidth + lane, value); },
+                         [&](unsigned i)
+                         {
+                             auto k = k0.get() + half + i;
 
-                         write(bTile, (half + i) * tileWidth + lane, value);
-                     }
+                             return select(k < innerCount,
+                                           weight(bRow + min(k, innerCount - 1u)),
+                                           0.f);
+                         });
                  }
                  else
                  {
@@ -516,7 +521,71 @@ struct TiledMatMulProgram final : ComputeProgram
         }
     }
 
-    Float weight(const UInt& index) { return storedWeight<bStorage>(b, index); }
+    Float weight(const UInt& index)
+    {
+        return storedWeight<bStorage>(b, index, scaleBase());
+    }
+
+    // The eight consecutive weights of B one staging thread fetches, placed
+    // into the tile by `place` and, where the run is not one a wide read can
+    // take, computed one at a time by `narrow`.
+    //
+    // **A quantized run is one load and one scale where the loop is eight of
+    // each.** eacp's graph shares constants and pure binaries and nothing
+    // else, so eight storedWeight calls at eight consecutive indices are eight
+    // buffer reads of the two words they lie in and eight reads of the one
+    // block scale they share. readInt8x8 is that fetch as a single eight-byte
+    // load with the scale hoisted out of it, which is the whole of what the
+    // quantized path costs prefill over the packed one.
+    //
+    // Behind a test, because the wide read needs the run whole and
+    // eight-aligned: a slab running past the inner extent, and a B whose row
+    // stride is not a multiple of eight, take the loop. So does every storage
+    // but the quantized one, which is the only one with a wider load to reach
+    // for — a packed record of four is already a whole eight-byte word.
+    template <typename Place, typename Narrow>
+    void stageWeightRun(const UInt& first,
+                        const Bool& whole,
+                        Place&& place,
+                        Narrow&& narrow)
+    {
+        const auto oneAtATime = [&]
+        {
+            for (auto i = 0u; i < 8u; ++i)
+                place(i, narrow(i));
+        };
+
+        if constexpr (bStorage != WeightStorage::Int8Blocks)
+        {
+            oneAtATime();
+            return;
+        }
+
+        ifThen(
+            whole && first % 8u == 0u,
+            [&]
+            {
+                auto run = storedWeight8<bStorage>(b, first, scaleBase());
+                const Float values[8] = {run.low.x(),
+                                         run.low.y(),
+                                         run.low.z(),
+                                         run.low.w(),
+                                         run.high.x(),
+                                         run.high.y(),
+                                         run.high.z(),
+                                         run.high.w()};
+
+                for (auto i = 0u; i < 8u; ++i)
+                    place(i, values[i]);
+            },
+            oneAtATime);
+    }
+
+    // Where B's per-block scales begin, in halves: past its columnCount rows of
+    // bStride, both of which are already uniforms. Only a ContiguousK operand
+    // is ever quantized — a weight is what a repo ships narrow — and only that
+    // storage reads this. See storedWeight.
+    UInt scaleBase() { return columnCount * bStride / 2u; }
 
     // Written out rather than declared by EACP_SHADER because the maxima
     // bindings belong to one instantiation each: a program that does not read
@@ -589,6 +658,8 @@ using HalfWeightTiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
 using BFloat16WeightTiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedBFloat16>;
+using Int8WeightTiledLinear =
+    TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Int8Blocks>;
 using TiledMatMul =
     TiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxTiledMatMul = TiledMatMulProgram<OperandLayout::ContiguousN,

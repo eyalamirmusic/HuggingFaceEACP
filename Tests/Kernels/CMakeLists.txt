@@ -4,6 +4,7 @@ set(kernel_test_sources
         EmbedTests.cpp
         GeGLUTests.cpp
         GeluTests.cpp
+        Int8BlocksTests.cpp
         LinearTests.cpp
         MatMulTests.cpp
         MultiQueryAttentionTests.cpp

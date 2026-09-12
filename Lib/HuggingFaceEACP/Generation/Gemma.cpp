@@ -182,6 +182,16 @@ void Gemma::setPromptCapacity(int rows)
     promptRowCapacity = rows;
 }
 
+void Gemma::setWeightPrecision(WeightPrecision toUse)
+{
+    precision = toUse;
+}
+
+Vector<WeightStorage> Gemma::weightStorages() const
+{
+    return weights ? weights->storages() : Vector<WeightStorage> {};
+}
+
 // Through a Sampler rather than stored raw, so the options are validated where
 // SamplingError says they are and a temperature that describes no distribution
 // is refused here rather than at the first draw.
@@ -208,7 +218,7 @@ void Gemma::prepare(Device& device)
 
     // The weights first, because the decoder compiles the product programs
     // their storage needs and no others — see Decoder::prepare.
-    weights.emplace(*weightFile, decoderShape);
+    weights.emplace(*weightFile, decoderShape, precision);
 
     decoder.emplace(decoderShape);
     decoder->prepare(device, *weights);

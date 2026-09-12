@@ -10,6 +10,7 @@
 // headers, included the way WhisperEACP's Tests/Decoder/Common.h includes the
 // encoder's.
 #include "../Kernels/Common.h"
+#include "../Kernels/TiledProduct.h"
 #include "../Model/Common.h"
 
 #include <cmath>
@@ -54,6 +55,20 @@ inline GemmaConfig smallGemmaConfig()
 inline DecoderShape smallDecoderShape()
 {
     return DecoderShape::fromConfig(smallGemmaConfig());
+}
+
+// The same small shape with a feed-forward width the int8 blocks divide. 48 is
+// not a whole number of thirty-twos, so down_proj's [width, intermediate] rows
+// are exactly what TensorLoader refuses to quantize — which every real Gemma
+// tensor passes and this one does not, and is why the quantized tiers run at 64
+// instead. Nothing else about the shape moves, so the two are the same model at
+// two feed-forward widths rather than two models.
+inline GemmaConfig smallQuantizableGemmaConfig()
+{
+    auto config = smallGemmaConfig();
+    config.intermediateSize = 64;
+
+    return config;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +313,10 @@ public:
     explicit SyntheticCheckpoint(
         std::string_view name,
         Sharding sharding = Sharding::Single,
-        TensorEdit edit = [](Vector<SyntheticTensor>&) {})
+        TensorEdit edit = [](Vector<SyntheticTensor>&) {},
+        GemmaConfig configToUse = smallGemmaConfig())
         : scratch(name)
-        , modelConfig(smallGemmaConfig())
+        , modelConfig(configToUse)
     {
         write(sharding, edit);
 

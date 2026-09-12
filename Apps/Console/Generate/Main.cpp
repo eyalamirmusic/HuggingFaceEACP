@@ -35,6 +35,8 @@ constexpr auto usage =
     "  --top-k K        keep only the K largest logits (default: all)\n"
     "  --top-p P        keep the smallest set reaching mass P (default: 1)\n"
     "  --seed S         the draw's seed, so a run is reproducible\n"
+    "  --int8           quantize the weights at load: blocks of 32 with an\n"
+    "                   fp16 scale each, 2.7 GB of weights rather than 5.0\n"
     "\n"
     "The model is the gemma-2b the build copied beside this binary. Set\n"
     "GEMMA_MODEL_DIR to run a checkpoint of your own instead: a directory\n"
@@ -63,6 +65,7 @@ struct Request
     std::string prompt;
     int maximumTokens = 0;
     HF::SamplingOptions sampling = HF::SamplingOptions::greedy();
+    HF::WeightPrecision weights = HF::WeightPrecision::AsShipped;
 };
 
 bool readsValue(std::string_view argument,
@@ -82,8 +85,9 @@ bool readsValue(std::string_view argument,
     return true;
 }
 
-// Each argument is one of the five flags and its value, or the prompt. Two
-// prompts is a quoting mistake rather than a second run, so it is refused.
+// Each argument is one of the five valued flags and its value, the one flag
+// that takes none, or the prompt. Two prompts is a quoting mistake rather than
+// a second run, so it is refused.
 bool parse(const HF::Vector<std::string>& arguments, Request& request)
 {
     auto prompts = 0;
@@ -103,6 +107,8 @@ bool parse(const HF::Vector<std::string>& arguments, Request& request)
             request.sampling.topP = (float) std::atof(value.c_str());
         else if (readsValue(argument, "--seed", arguments, index, value))
             request.sampling.seed = std::strtoull(value.c_str(), nullptr, 10);
+        else if (argument == "--int8")
+            request.weights = HF::WeightPrecision::Int8Blocks;
         else if (argument.starts_with("--"))
             return false;
         else if (++prompts == 1)
@@ -125,6 +131,14 @@ void report(const HF::Gemma& gemma, int promptTokens, int tokenCount, double loa
     const auto decodeRate = decode > 0.0 ? tokenCount / decode : 0.0;
 
     std::fprintf(stderr, "\n");
+
+    // What the weights became rather than what was asked for, since a
+    // checkpoint decides three of the four storages and only int8 is ours.
+    for (const auto storage: gemma.weightStorages())
+        std::fprintf(stderr,
+                     "  weights            %s\n",
+                     std::string {HF::weightStorageName(storage)}.c_str());
+
     std::fprintf(stderr, "  load and upload   %8.3f s\n", loading);
     std::fprintf(stderr,
                  "  prefill, %4d in   %8.3f s   %7.1f tokens/s\n",
@@ -151,6 +165,7 @@ void run(const Request& request)
     else
         gemma.loadBundled();
 
+    gemma.setWeightPrecision(request.weights);
     gemma.prepare();
 
     if (request.maximumTokens > 0)

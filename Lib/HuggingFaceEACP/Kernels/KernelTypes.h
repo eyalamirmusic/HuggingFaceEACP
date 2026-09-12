@@ -11,10 +11,13 @@ namespace HF
 // and operators need no import: their arguments are eacp::GPU types, so ADL
 // finds them.
 using eacp::GPU::AtomicBuffer;
+using eacp::GPU::Bool;
 using eacp::GPU::ComputePass;
 using eacp::GPU::ComputeProgram;
 using eacp::GPU::Float;
 using eacp::GPU::Float4;
+using eacp::GPU::Float4Pair;
+using eacp::GPU::Float4Quad;
 using eacp::GPU::InputBuffer;
 using eacp::GPU::OutputBuffer;
 using eacp::GPU::Shared;

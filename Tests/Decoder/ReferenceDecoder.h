@@ -64,6 +64,44 @@ inline ReferenceModel readReferenceModel(const ShardedTensors& file,
     return model;
 }
 
+// The same model as the quantized path holds it: every tensor a product or the
+// gather reads taken through the loader's own quantizer and straight back
+// through its dequantizer, so the reference runs on the numbers the shader
+// reads rather than on the ones the checkpoint shipped.
+//
+// The two norm scales are left alone because the loader leaves them alone —
+// they are widened to F32 whatever the precision is.
+//
+// **gate and up are round-tripped separately and the loader stacks them**, and
+// the two agree: each half's element count is a whole number of blocks, so a
+// block of the stack never straddles the seam and the same thirty-two elements
+// share a scale either way.
+inline ReferenceModel quantizedReferenceModel(ReferenceModel model)
+{
+    auto through = [](Vector<float>& values)
+    {
+        auto widened = Vector<float> {};
+        TiledProduct::quantizedInt8Blocks(values, widened);
+
+        values = widened;
+    };
+
+    through(model.embedding);
+
+    for (auto& layer: model.layers)
+    {
+        through(layer.query);
+        through(layer.key);
+        through(layer.value);
+        through(layer.output);
+        through(layer.gate);
+        through(layer.up);
+        through(layer.down);
+    }
+
+    return model;
+}
+
 // x * rsqrt(mean(x^2) + epsilon) * (1 + w), which is Gemma's only
 // normalisation: no mean subtraction, no bias, and the scale offset by one
 // because GemmaRMSNorm stores the offset rather than the scale.
@@ -356,9 +394,11 @@ struct StepResult
 class DecoderRun
 {
 public:
-    DecoderRun(const DecoderShape& shapeToUse, const ShardedTensors& file)
+    DecoderRun(const DecoderShape& shapeToUse,
+               const ShardedTensors& file,
+               WeightPrecision precision = WeightPrecision::AsShipped)
         : decoderShape(shapeToUse)
-        , weights(file, shapeToUse)
+        , weights(file, shapeToUse, precision)
         , decoder(shapeToUse)
     {
         decoder.prepare(eacp::GPU::Device::shared(), weights);

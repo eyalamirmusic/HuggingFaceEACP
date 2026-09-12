@@ -12,6 +12,24 @@ namespace HF
 // gives it rather than as the file claims it.
 using TensorShape = std::initializer_list<int>;
 
+// What a product weight goes to the device as. AsShipped is the checkpoint's
+// own — F32, fp16 or bf16, the bytes as they lie — and is what everything here
+// did before there was a choice.
+//
+// Int8Blocks quantizes on the way up, into the layout Kernels/Int8Blocks.h
+// describes: thirty-two elements to a block, one fp16 scale each, 1.0625 bytes
+// an element against bf16's two. It costs a pass over every weight at load and
+// a little accuracy per element, and it buys the only thing a decode step is
+// short of, which is bytes.
+//
+// Only the tensors a product or the gather reads take it. The norm scales are
+// widened to F32 whatever this says, for the reason DecoderWeights gives.
+enum class WeightPrecision
+{
+    AsShipped,
+    Int8Blocks
+};
+
 // The checks a weight struct runs on the way from a checkpoint to the
 // TensorBuffer it hands a kernel: the checkpoint carries the tensor, the
 // tensor has the shape the config implies, and its storage is one the program
@@ -44,9 +62,16 @@ struct TensorLoader
     TensorBuffer loadFloatTensor(const std::string& name,
                                  TensorShape expected) const;
 
-    // A weight a product kernel reads, which is the one that may stay packed.
-    TensorBuffer loadProjectionWeight(const std::string& name,
-                                      TensorShape expected) const;
+    // A weight a product kernel reads, which is the one that may stay packed —
+    // or be quantized, when the caller asks for Int8Blocks. A tensor whose
+    // contiguous dimension is not a whole number of blocks, or whose element
+    // count is not a whole number of scale words, is a ModelError naming it and
+    // both numbers rather than a silently different layout; every Gemma tensor
+    // passes.
+    TensorBuffer loadProjectionWeight(
+        const std::string& name,
+        TensorShape expected,
+        WeightPrecision precision = WeightPrecision::AsShipped) const;
 
     // Two weights of one shape as a single buffer, the first's rows then the
     // second's — the concatenation Gemma's fused gate-and-up weight is. Both
@@ -66,8 +91,16 @@ struct TensorLoader
     // also where a GPU buffer's int-sized byte count is reachable — plan.md's
     // second gap. It is counted in 64 bits and refused by name rather than
     // truncated.
-    TensorBuffer loadStackedProjectionWeights(const std::string& first,
-                                              const std::string& second,
-                                              TensorShape expected) const;
+    //
+    // **Quantized, the stack is one tensor rather than two.** The halves are
+    // read, widened and quantized into the one buffer in order, so a block is
+    // thirty-two elements of whichever half it fell in — which is the same
+    // blocks quantizing them separately would have made, since each half's
+    // element count is a whole number of them.
+    TensorBuffer loadStackedProjectionWeights(
+        const std::string& first,
+        const std::string& second,
+        TensorShape expected,
+        WeightPrecision precision = WeightPrecision::AsShipped) const;
 };
 } // namespace HF

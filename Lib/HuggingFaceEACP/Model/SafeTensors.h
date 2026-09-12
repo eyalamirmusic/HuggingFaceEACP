@@ -34,10 +34,24 @@ struct TensorInfo
     std::int64_t dimension(int index) const;
 };
 
+// How a buffer's bytes are arranged, beside what `storage` says each of them
+// is. Elements is every tensor a checkpoint ships: one element after another,
+// nothing else in the buffer. Int8Blocks is the quantized form this tree makes
+// rather than reads — the elements as signed bytes followed by one fp16 scale
+// per block of thirty-two, which is Kernels/Int8Blocks.h's layout — and it is a
+// second axis rather than a fourteenth TensorType because no safetensors dtype
+// names it and its `storage` is honestly I8.
+enum class BufferLayout
+{
+    Elements,
+    Int8Blocks
+};
+
 // A tensor uploaded to the device, and what the buffer's elements are: F32 for
 // the float buffer a kernel subscripts, F16 or BF16 for one still packed two
 // sixteen-bit floats to a word, which a kernel reads through
-// InputBuffer::readHalf or InputBuffer::readBFloat16.
+// InputBuffer::readHalf or InputBuffer::readBFloat16, and I8 in the block
+// layout above for one the loader quantized.
 //
 // The two travel together because nothing about a GPU::Buffer says which of
 // them it holds, and binding a packed buffer where a float one is expected is
@@ -49,10 +63,22 @@ struct TensorBuffer
 {
     eacp::GPU::Buffer buffer;
     TensorType storage = TensorType::F32;
+    BufferLayout layout = BufferLayout::Elements;
 
     bool isPackedHalf() const { return storage == TensorType::F16; }
     bool isPackedBFloat16() const { return storage == TensorType::BF16; }
+    bool isInt8Blocks() const { return layout == BufferLayout::Int8Blocks; }
 };
+
+// A run of a tensor's elements widened to float32, for a caller walking a large
+// tensor a piece at a time rather than holding all of it: `bytes` are the
+// tensor's own, `first` is the element to begin at, and `destination` says how
+// many to take. Exactly the widening readFloats does — F16 and BF16 both widen
+// exactly — and a type no shader reads is a ModelError naming the tensor.
+void widenTensorElements(const TensorInfo& tensor,
+                         Span<const std::uint8_t> bytes,
+                         std::int64_t first,
+                         Span<float> destination);
 
 // A safetensors file: eight bytes of little-endian header length, that many
 // bytes of JSON naming every tensor, then one raw blob the offsets in that JSON

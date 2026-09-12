@@ -52,6 +52,17 @@
 // elementwise check fails while the argmax and the top five agree, the
 // tolerance is what is wrong; if the argmax disagrees, we are.
 //
+// **Every comparison runs twice, once per weight storage.** The second pass is
+// over weights the loader quantized into int8 blocks, and the point of it is
+// the contrast: the elementwise differences go to 0.364, 0.285 and 0.242
+// relative — a hundred times the bf16 path's, because they are the format's
+// error and not the accumulation order's — while every row's argmax still
+// agrees with llama.cpp and the eight-token greedy continuation is the same
+// eight tokens. Four rows of the fifty compared do swap a fifth token, and each
+// of those four is a pair the reference's own logits put within 0.2 of each
+// other. See quantizedLogitTolerance and quantizedTieGap for the numbers those
+// two bounds were set from.
+//
 // Everything skips without a device, without a checkpoint, and without the
 // GGUF beside the safetensors. The fetched mirror does not carry one, but the
 // pinned llama.cpp tree's convert_hf_to_gguf.py makes it from the fetched
@@ -75,6 +86,26 @@ constexpr auto oracleWindow = LlamaOracle::defaultContextSize;
 // Five times the worst relative difference the three prompts have measured.
 // See the note above for what that measurement was.
 constexpr auto logitTolerance = 5e-2;
+
+// The same discipline over the quantized weights, whose elementwise
+// differences are the format's rather than the accumulation order's and so are
+// a hundred times larger: a run measures 0.364, 0.285 and 0.242 relative over
+// the three prompts and 0.364 one token at a time, and this is five times the
+// worst of them at one digit.
+constexpr auto quantizedLogitTolerance = 2.0;
+
+// How far apart two tokens' reference logits may be for a swap between them at
+// the edge of the top five to be a tie rather than a disagreement.
+//
+// Zero for the exact storages, which put the same five tokens in the top five
+// on every row the suite has ever run. The quantized path does not, on four
+// rows of the fifty this suite compares, and each of those four is the same
+// shape: our fifth and llama.cpp's fifth are two tokens whose reference logits
+// are 0.196, 0.098, 0.0003 and 0.075 apart — a boundary the reference's own
+// numbers do not separate. 1.0 is five times the worst of those, so a swap the
+// distribution really disagrees about still fails.
+constexpr auto exactTopSets = 0.0;
+constexpr auto quantizedTieGap = 1.0;
 
 // How many of a row's largest tokens have to be the same set. Five is past
 // where a sampler's top-k usually cuts and far enough down the row that
@@ -129,15 +160,17 @@ bool canCompareNumbers()
 class OurDecoding
 {
 public:
-    OurDecoding()
+    explicit OurDecoding(WeightPrecision precision = WeightPrecision::AsShipped)
         : files(gemmaModelFiles())
         , modelConfig(GemmaConfig::fromModelFiles(files))
         , decoderShape(windowedShape(modelConfig))
-        , weights(ShardedTensors::fromModelFiles(files), decoderShape)
+        , weights(ShardedTensors::fromModelFiles(files), decoderShape, precision)
         , decoder(decoderShape)
     {
         decoder.prepare(Device::shared(), weights);
     }
+
+    WeightStorage storage() const { return weightStorageOf(weights.tokenEmbedding); }
 
     const GemmaConfig& config() const { return modelConfig; }
     const DecoderShape& shape() const { return decoderShape; }
@@ -200,16 +233,30 @@ private:
     Decoder decoder;
 };
 
-// One of these for the executable. The weights are ten gigabytes of BF16
-// widened to F32 on the way to the device and preparing compiles every kernel,
-// so a second would double a run that already holds llama.cpp's ten gigabytes
-// beside it — the same reason sharedOracle() in Common.h is one oracle.
+// One of these per precision for the executable. The weights are five
+// gigabytes of BF16 and preparing compiles every kernel, so a third would add
+// to a run that already holds llama.cpp's ten gigabytes beside it — the same
+// reason sharedOracle() in Common.h is one oracle.
+//
+// Two rather than one because the comparison is the point: the same eighteen
+// layers against the same reference over the bytes the checkpoint ships and
+// over the bytes the loader quantized them into, so the difference between the
+// two columns below is the format and nothing else. The quantized one is built
+// on first use, so a run that only reaches the bf16 tests never pays for it.
 //
 // Every test below opens with beginSequence(), so sharing one carries no state
 // from the test before it.
 OurDecoding& ourDecoding()
 {
     static const auto decoding = std::make_unique<OurDecoding>();
+    return *decoding;
+}
+
+OurDecoding& ourQuantizedDecoding()
+{
+    static const auto decoding =
+        std::make_unique<OurDecoding>(WeightPrecision::Int8Blocks);
+
     return *decoding;
 }
 
@@ -247,7 +294,8 @@ struct RowDifference
     }
 };
 
-RowDifference compareRow(Span<const float> ours, Span<const float> theirs)
+RowDifference
+    compareRow(Span<const float> ours, Span<const float> theirs, double tolerance)
 {
     auto difference = RowDifference {};
 
@@ -263,7 +311,7 @@ RowDifference compareRow(Span<const float> ours, Span<const float> theirs)
 
         difference.everyElementIsClose =
             difference.everyElementIsClose
-            && isClose(ours[index], expected, logitTolerance);
+            && isClose(ours[index], expected, tolerance);
     }
 
     return difference;
@@ -304,6 +352,46 @@ bool sameTokenSet(Vector<TokenId> ours, Vector<TokenId> theirs)
     return std::equal(ours.begin(), ours.end(), theirs.begin(), theirs.end());
 }
 
+// What two rows' five largest came to: whether they are the same five, and —
+// when they are not — how far from the reference's own fifth largest the tokens
+// the two sides disagreed about sit, in the reference's numbers.
+//
+// That distance is what separates a disagreement from a tie. A token the two
+// implementations put on opposite sides of the cut, whose reference logit is a
+// tenth of a logit from the reference's own fifth, sits at a boundary neither
+// row's numbers resolve; one a whole logit outside it is a different
+// distribution.
+struct TopSetAgreement
+{
+    bool exact = true;
+    double gap = 0.0;
+};
+
+TopSetAgreement compareTopSets(Span<const float> ours, Span<const float> theirs)
+{
+    const auto mine = largestTokens(ours, topTokens);
+    const auto reference = largestTokens(theirs, topTokens);
+
+    if (sameTokenSet(mine, reference))
+        return {};
+
+    auto agreement = TopSetAgreement {false, 0.0};
+    const auto fifth = (double) theirs[reference[topTokens - 1]];
+
+    auto widen = [&](const Vector<TokenId>& set, const Vector<TokenId>& other)
+    {
+        for (const auto token: set)
+            if (std::find(other.begin(), other.end(), token) == other.end())
+                agreement.gap = std::max(agreement.gap,
+                                         std::abs((double) theirs[token] - fifth));
+    };
+
+    widen(mine, reference);
+    widen(reference, mine);
+
+    return agreement;
+}
+
 bool sameTokens(Span<const TokenId> ours, Span<const TokenId> theirs)
 {
     return std::equal(ours.begin(), ours.end(), theirs.begin(), theirs.end());
@@ -317,13 +405,29 @@ struct RowAgreement
     RowDifference difference;
     bool everyArgmaxAgrees = true;
     bool everyTopSetAgrees = true;
+
+    // How many rows picked a different fifth token, and the largest distance
+    // from the reference's own fifth logit that any of those swaps spanned.
+    int tiedTopSets = 0;
+    double worstTieGap = 0.0;
+
+    void takeTopSet(const TopSetAgreement& top)
+    {
+        if (top.exact)
+            return;
+
+        ++tiedTopSets;
+        worstTieGap = std::max(worstTieGap, top.gap);
+    }
 };
 
 RowAgreement compareRows(const Vector<float>& ours,
                          const Vector<float>& theirs,
                          int firstRow,
                          int rowCount,
-                         int width)
+                         int width,
+                         double tolerance,
+                         double tieGap)
 {
     auto agreement = RowAgreement {};
 
@@ -332,16 +436,17 @@ RowAgreement compareRows(const Vector<float>& ours,
         const auto mine = rowOf(ours, row, width);
         const auto reference = rowOf(theirs, firstRow + row, width);
 
-        agreement.difference.take(compareRow(mine, reference));
+        agreement.difference.take(compareRow(mine, reference, tolerance));
 
         agreement.everyArgmaxAgrees =
             agreement.everyArgmaxAgrees
             && Sampler::argmax(mine) == Sampler::argmax(reference);
 
+        const auto top = compareTopSets(mine, reference);
+
+        agreement.takeTopSet(top);
         agreement.everyTopSetAgrees =
-            agreement.everyTopSetAgrees
-            && sameTokenSet(largestTokens(mine, topTokens),
-                            largestTokens(reference, topTokens));
+            agreement.everyTopSetAgrees && (top.exact || top.gap <= tieGap);
     }
 
     return agreement;
@@ -351,11 +456,20 @@ void reportAndCheck(std::string_view what, const RowAgreement& agreement)
 {
     std::cout << "  " << what << ": max |a - e| " << agreement.difference.absolute
               << ", max relative " << agreement.difference.relative
-              << ", over logits reaching " << agreement.difference.magnitude << "\n";
+              << ", over logits reaching " << agreement.difference.magnitude;
+
+    if (agreement.tiedTopSets > 0)
+        std::cout << ", " << agreement.tiedTopSets
+                  << " rows swapping a fifth token within " << agreement.worstTieGap
+                  << " logits";
+
+    std::cout << "\n";
 
     // The two the comparison exists for.
     check(agreement.everyArgmaxAgrees, "every row's argmax agrees");
-    check(agreement.everyTopSetAgrees, "every row's five largest are the same five");
+    check(agreement.everyTopSetAgrees,
+          "every row's five largest are the same five, or differ only where the "
+          "reference itself calls them a tie");
 
     // And the elementwise one, which is the number the bound was set from and
     // is what a run is read for.
@@ -421,26 +535,28 @@ void checkAgainstMetadata(const LlamaOracle& oracle,
 
     check(std::abs(*value - expected) <= 1e-3 * std::abs(expected), field);
 }
-} // namespace
 
-// The prompt's own rows, which is prefill: one step of several tokens, causally
-// masked, against the oracle decoding the same tokens in one batch.
-//
-// Both sides are handed the same ids — ours, out of our tokenizer with BOS in
-// front — so nothing here can be a tokenization difference. That is checked
-// separately in TokenizerOracleTests and is not re-litigated per prompt.
-auto tPromptLogitsAgree = test("Oracle/Decoder/promptLogitsAgree") = []
+// ---------------------------------------------------------------------------
+// The three comparisons, each run once per weight storage
+// ---------------------------------------------------------------------------
+
+// Whether the oracle and one of our decodings are both there, and how a run
+// names which storage it is reporting on.
+bool oracleIsReady()
 {
-    if (!canRun())
-        return;
+    check(sharedOracle().isValid(), "the GGUF loaded");
+    return sharedOracle().isValid();
+}
 
+std::string labelled(const OurDecoding& ours, std::string_view what)
+{
+    return std::string {weightStorageName(ours.storage())} + ", "
+           + std::string {what};
+}
+
+void checkPromptLogits(OurDecoding& ours, double tolerance, double tieGap)
+{
     auto& oracle = sharedOracle();
-    check(oracle.isValid(), "the GGUF loaded");
-
-    if (!oracle.isValid())
-        return;
-
-    auto& ours = ourDecoding();
     const auto width = ours.vocabularySize();
 
     check(width == oracle.vocabularySize(), "the two vocabularies are one size");
@@ -469,32 +585,16 @@ auto tPromptLogitsAgree = test("Oracle/Decoder/promptLogitsAgree") = []
         if (rows.size() != reference.size())
             continue;
 
-        reportAndCheck(prompt,
-                       compareRows(rows, reference, 0, tokens.size(), width));
+        reportAndCheck(
+            labelled(ours, prompt),
+            compareRows(
+                rows, reference, 0, tokens.size(), width, tolerance, tieGap));
     }
-};
+}
 
-// The same prompt one token per step, which is what every step of a real
-// generation is: the split product and the decode attention rather than the
-// tiled product and the prefill one, and a KV cache that has to hold what the
-// steps before it wrote.
-//
-// The oracle computes the whole sequence in one batch from position zero, so
-// this says our cache reproduces a full re-run — the property plan.md's fourth
-// step is built on, checked here at the real width against an implementation
-// that shares none of our code.
-auto tTokenByTokenAgrees = test("Oracle/Decoder/tokenByTokenAgrees") = []
+void checkTokenByToken(OurDecoding& ours, double tolerance, double tieGap)
 {
-    if (!canRun())
-        return;
-
     auto& oracle = sharedOracle();
-    check(oracle.isValid(), "the GGUF loaded");
-
-    if (!oracle.isValid())
-        return;
-
-    auto& ours = ourDecoding();
     const auto width = ours.vocabularySize();
     const auto tokens = ourTokenizer().encodeWithBos(capitalPrompt);
 
@@ -519,40 +619,24 @@ auto tTokenByTokenAgrees = test("Oracle/Decoder/tokenByTokenAgrees") = []
         if (row.size() != width)
             return;
 
-        const auto step = compareRows(row, reference, index, 1, width);
+        const auto step =
+            compareRows(row, reference, index, 1, width, tolerance, tieGap);
 
         agreement.difference.take(step.difference);
         agreement.everyArgmaxAgrees =
             agreement.everyArgmaxAgrees && step.everyArgmaxAgrees;
         agreement.everyTopSetAgrees =
             agreement.everyTopSetAgrees && step.everyTopSetAgrees;
+        agreement.tiedTopSets += step.tiedTopSets;
+        agreement.worstTieGap = std::max(agreement.worstTieGap, step.worstTieGap);
     }
 
-    reportAndCheck("one token at a time", agreement);
-};
+    reportAndCheck(labelled(ours, "one token at a time"), agreement);
+}
 
-// The loop itself: our decoder driven greedily off its own choices, against
-// llama.cpp's greedy continuation of the same prompt.
-//
-// Nothing feeds either side the other's token, which is the point — a
-// disagreement at step k sends the two down different sequences and every step
-// after it disagrees too. That is a harsher test than following the reference,
-// and it is the one that matches what a generation loop will do.
-//
-// Sampler::argmax over a row read back is the CPU half of a step, and it is
-// Kernels/Argmax.h's rule: the largest logit, the lower index on a tie.
-auto tGreedyContinuationAgrees = test("Oracle/Decoder/greedyContinuationAgrees") = []
+void checkGreedyContinuation(OurDecoding& ours)
 {
-    if (!canRun())
-        return;
-
     auto& oracle = sharedOracle();
-    check(oracle.isValid(), "the GGUF loaded");
-
-    if (!oracle.isValid())
-        return;
-
-    auto& ours = ourDecoding();
     const auto width = ours.vocabularySize();
     const auto prompt = ourTokenizer().encodeWithBos(capitalPrompt);
 
@@ -585,12 +669,111 @@ auto tGreedyContinuationAgrees = test("Oracle/Decoder/greedyContinuationAgrees")
 
     const auto text = ourTokenizer().decode(generated);
 
-    std::cout << "  \"" << capitalPrompt << "\" -> \"" << text << "\", ours "
-              << spelled(generated) << ", llama.cpp " << spelled(expected) << "\n";
+    std::cout << "  " << labelled(ours, "\"") << capitalPrompt << "\" -> \"" << text
+              << "\", ours " << spelled(generated) << ", llama.cpp "
+              << spelled(expected) << "\n";
 
     check(sameTokens(generated, expected), "the greedy continuations agree");
     check(text.find("Paris") != std::string::npos,
           "Paris arrives within eight tokens");
+}
+} // namespace
+
+// The prompt's own rows, which is prefill: one step of several tokens, causally
+// masked, against the oracle decoding the same tokens in one batch.
+//
+// Both sides are handed the same ids — ours, out of our tokenizer with BOS in
+// front — so nothing here can be a tokenization difference. That is checked
+// separately in TokenizerOracleTests and is not re-litigated per prompt.
+auto tPromptLogitsAgree = test("Oracle/Decoder/promptLogitsAgree") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkPromptLogits(ourDecoding(), logitTolerance, exactTopSets);
+};
+
+// The same prompt one token per step, which is what every step of a real
+// generation is: the split product and the decode attention rather than the
+// tiled product and the prefill one, and a KV cache that has to hold what the
+// steps before it wrote.
+//
+// The oracle computes the whole sequence in one batch from position zero, so
+// this says our cache reproduces a full re-run — the property plan.md's fourth
+// step is built on, checked here at the real width against an implementation
+// that shares none of our code.
+auto tTokenByTokenAgrees = test("Oracle/Decoder/tokenByTokenAgrees") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkTokenByToken(ourDecoding(), logitTolerance, exactTopSets);
+};
+
+// The loop itself: our decoder driven greedily off its own choices, against
+// llama.cpp's greedy continuation of the same prompt.
+//
+// Nothing feeds either side the other's token, which is the point — a
+// disagreement at step k sends the two down different sequences and every step
+// after it disagrees too. That is a harsher test than following the reference,
+// and it is the one that matches what a generation loop will do.
+//
+// Sampler::argmax over a row read back is the CPU half of a step, and it is
+// Kernels/Argmax.h's rule: the largest logit, the lower index on a tie.
+auto tGreedyContinuationAgrees = test("Oracle/Decoder/greedyContinuationAgrees") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkGreedyContinuation(ourDecoding());
+};
+
+// ---------------------------------------------------------------------------
+// The same three against the quantized weights
+// ---------------------------------------------------------------------------
+
+// plan.md's gap 6, at the tier that can say whether it changed the model's
+// answers: the same eighteen layers against the same llama.cpp rows, over
+// weights the loader quantized into int8 blocks rather than the bytes the
+// checkpoint ships.
+//
+// **The elementwise differences are larger and the argmaxes are not.** That is
+// the whole claim, and it is what quantizedLogitTolerance is set from — five
+// times the worst a run measures, the same discipline logitTolerance was set
+// by. A bound that had been loosened until it passed would say nothing; the
+// top-five check beside it is what carries the meaning, and an argmax that
+// disagreed would be a finding rather than a tolerance to widen.
+auto tQuantizedPromptLogitsAgree =
+    test("Oracle/Decoder/quantizedPromptLogitsAgree") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkPromptLogits(
+        ourQuantizedDecoding(), quantizedLogitTolerance, quantizedTieGap);
+};
+
+auto tQuantizedTokenByTokenAgrees =
+    test("Oracle/Decoder/quantizedTokenByTokenAgrees") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkTokenByToken(
+        ourQuantizedDecoding(), quantizedLogitTolerance, quantizedTieGap);
+};
+
+// The harshest of the three at this precision: eight tokens of greedy
+// continuation with nothing feeding either side the other's choice, so a single
+// step where the quantization moved an argmax sends the two down different
+// sequences and every step after it disagrees too.
+auto tQuantizedGreedyContinuationAgrees =
+    test("Oracle/Decoder/quantizedGreedyContinuationAgrees") = []
+{
+    if (!canRun() || !oracleIsReady())
+        return;
+
+    checkGreedyContinuation(ourQuantizedDecoding());
 };
 
 // plan.md's "confirm every number against config.json", from the other side:

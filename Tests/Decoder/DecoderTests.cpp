@@ -393,3 +393,71 @@ auto tShardedCheckpointDecodesTheSame =
 
     std::cout << "  two shards: worst error " << worst << "\n";
 };
+
+// plan.md's gap 6: the same forward pass over weights the loader quantized into
+// int8 blocks on the way up. The checkpoint is the ordinary one — nothing about
+// the file changes — and what changes is the precision the loader was asked
+// for, so what this compares is one decoder against one reference over two
+// different sets of numbers for the same model.
+//
+// **The reference is given no allowance for the quantization either.** It reads
+// the checkpoint through readFloats and then takes every tensor a product or
+// the gather reads through the very quantizer the loader called and back
+// through its dequantizer, so both sides run on the quantized weights and what
+// is left to disagree about is float32 accumulation — the same tolerance the
+// exact paths answer to. A test that had loosened the tolerance instead would
+// have been measuring the format rather than the kernels.
+//
+// The feed-forward width is 64 rather than the suite's 48, because 48 is not a
+// whole number of blocks and TensorLoader refuses it — see
+// smallQuantizableGemmaConfig, and the refusal itself in DecoderWeightsTests.
+//
+// Both shapes are here for the reason the bf16 case has both: the prompt's
+// seven rows take the tiled product and the prefill attention, and the tokens
+// after it take the split product a decode step runs on.
+auto tInt8CheckpointMatchesReference =
+    test("Decoder/int8CheckpointMatchesReference") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint = SyntheticCheckpoint {"decoder-int8",
+                                                 Sharding::Single,
+                                                 asBFloat16(),
+                                                 smallQuantizableGemmaConfig()};
+
+    const auto shape = checkpoint.shape();
+    const auto tokens = promptTokens();
+
+    const auto expected = referenceDecode(
+        quantizedReferenceModel(readReferenceModel(checkpoint.weights(), shape)),
+        shape,
+        tokens);
+
+    auto run = DecoderRun {shape, checkpoint.weights(), WeightPrecision::Int8Blocks};
+
+    // Said outright rather than left to the loader's own suite, so this test is
+    // self-contained about which path it is exercising: a checkpoint that
+    // arrived packed would still decode correctly here and would be testing the
+    // bf16 kernels under an int8 name.
+    check(run.loaded().tokenEmbedding.isInt8Blocks());
+    check(run.loaded().layers[0].query.isInt8Blocks());
+    check(run.loaded().layers[0].fusedGateUp.isInt8Blocks());
+    check(run.loaded().layers[0].down.isInt8Blocks());
+    check(!run.loaded().layers[0].inputNorm.isInt8Blocks());
+
+    auto worst = checkStepAgainstReference(
+        run.step(tokens), expected, shape, 0, (int) tokens.size());
+
+    run.beginSequence();
+
+    for (auto index = 0; index < (int) tokens.size(); ++index)
+    {
+        const auto result = run.step({tokens[(std::size_t) index]});
+
+        worst = std::max(
+            worst, checkStepAgainstReference(result, expected, shape, index, 1));
+    }
+
+    std::cout << "  int8 checkpoint: worst error " << worst << "\n";
+};

@@ -155,14 +155,40 @@ matrix product, which is already the fast path.
 
 | weight storage | bytes per token | rough ceiling | measured |
 | --- | --- | --- | --- |
-| fp32, widened on the CPU — step 5 replaced it | 10 GB | ~50 tok/s | 46 to 49 |
-| **bf16 kept packed — what runs today** | 5 GB | ~100 tok/s | **83 to 91** |
-| int8 or int4 blocks, later | 1.3 to 2.5 GB | 200 to 400 tok/s | |
+| fp32, widened on the CPU — step 5 replaced it | 10.0 GB | ~50 tok/s | 46 to 49 |
+| bf16 kept packed — the default | 5.0 GB | ~100 tok/s | 85 to 96 |
+| **int8 blocks of 32 — what `--int8` runs** | 2.7 GB | ~190 tok/s | **141 to 162** |
+| int4 blocks, later | 1.4 GB | ~360 tok/s | |
 
-The measured column is one M-series device, Release, a 6-token prompt: 91
-tokens/s over 16 decode steps and 83 over 64, against 49 and 46 on the widened
-path. The ceilings were guesses from the bandwidth alone and the ratio came out
-at 1.8, which is what a bandwidth-bound step predicts.
+The measured column is one M4 Max, Release, a 6-token prompt, the median of
+three: 95.8 tokens/s over 16 decode steps and 86.5 over 64 on the bf16 path,
+against 49 and 46 on the widened one. The ceilings were guesses from the
+bandwidth alone and the first ratio came out at 1.9, which is what a
+bandwidth-bound step predicts. 95.8 tokens/s against 5.0 GB of weights a step is
+479 GB/s, so the remaining headroom to the guessed 100 was the memory system's
+and not a kernel's.
+
+**The int8 row reached 1.32x where its bytes predict 1.88x, and the fifth round
+took it to 1.63x by making the load as wide as the record.** 2.506 billion
+parameters at 1.0625 bytes is 2.66 GB a step. A quantized record of four weights
+was one word, four bytes, fetched by one `readInt8x4`, where a bf16 record of
+four is two words, eight bytes, fetched by one `readBFloat16x4` — the same load
+count for half the data, so a step that should have been bound by bandwidth was
+bound by how many loads it could issue. eacp's `readInt8x16` fetches sixteen
+weights in one sixteen-byte load, and with the lane count moved to match it the
+int8 path went from 298–335 GB/s to 375–430 GB/s against bf16's 433–479. See
+gap 6 for the calls and step 5's fifth round for the table.
+
+**What is left of the 1.88x is a fixed cost per step rather than the weights.**
+Take the 16-token runs: a bf16 step is 10.44 ms and an int8 step 6.19 ms, so
+2.34 GB fewer bytes buys 4.25 ms — 551 GB/s marginal, and subtracting each
+path's own weight traffic at that rate leaves 1.37 ms on the bf16 step and
+1.36 ms on the int8 one. One line fits both, which is what "bandwidth bound"
+means; the 1.36 ms is the couple of hundred dispatches a step is made of and the
+work that is not weights. Before the wide read the same arithmetic gave 893 GB/s
+marginal and a 4.96 ms fixed cost, which is half a step and not credible — the
+two paths did not lie on one line, which is exactly what a load-bound path looks
+like from the outside.
 
 A step is roughly 18 layers × a dozen dispatches, a few hundred per token,
 which is the same order as the Whisper decoder's step.
@@ -173,15 +199,25 @@ eacp comes from CPM at `develop`, and that is the only configuration this tree
 is built in — `CLAUDE.md` says why a local checkout drags whatever is
 uncommitted in it into this build.
 
-**Everything this tree asks of eacp is on `develop`.** Step 5's two rounds
-consume six additions — the BF16 reads, `readHalf4` / `readBFloat16x4`,
+**That was not always true; the last exception closed with eacp PR #52.** Step
+5's fourth and fifth rounds — the int8 weights below and the wide reads that
+made them pay — consume eacp's quantized reads, and for a while those were on a
+`quantized-reads` branch rather than on `develop`, so this tree was built with
+`-DCPM_eacp_SOURCE` pointed at a checkout of it. That was the second time that
+override has been used and is the one case it exists for. PR #52 merged the
+branch into `develop`, so the plain configure line is the whole story again,
+exactly as it became after step 5's first two rounds. What it supplied is
+listed under gap 6.
+
+**Everything else this tree asks of eacp is on `develop`.** Step 5's first two
+rounds consume six additions — the BF16 reads, `readHalf4` / `readBFloat16x4`,
 `saturatingTanh`, `simdSum` / `simdMax` / `simdMin`,
 `Device::maxThreadgroupMemory` with `ComputeProgram::threadgroupMemoryBytes` and
 `fitsThreadgroupMemory`, and `ComputePipeline::threadExecutionWidth` — and all
 of them are there. For a fortnight they were not: they were written on a branch
 and this tree built only against a checkout of it, which is what the
 `-DCPM_eacp_SOURCE` override exists for and the one case it is for. That is
-over; the plain configure line is the whole story again.
+over for those six, and with PR #52 it is over for the quantized reads too.
 
 Which is the project's second goal working as intended, and worth recording as
 a shape rather than as an anecdote. Every one of those six was found by writing
@@ -246,10 +282,110 @@ deleted code to use.
    drive the loop from the run loop the way `LiveTranscriber` does. Whether
    eacp wants a compute queue off the main thread is a bigger question than
    this project; not opened here.
-6. **Quantization, later.** Int8 and int4 block formats need `readByte` and
-   nibble helpers as the analogue of `readHalf`, plus per-block scales. eacp
-   has the uint arithmetic already, so this is convenience rather than
-   capability. It is the step from 100 to a few hundred tokens per second.
+6. **Quantization. Int8 done, in eacp `develop`, and used here; int4 next.**
+   The step from 100 to a few hundred tokens per second, and it is the one gap
+   whose answer this round can report a number for rather than a prediction.
+
+   **What eacp PR #52 supplied, and this tree uses.** `InputBuffer::readInt8`
+   and `readUInt8` counting bytes, `readInt8x4` / `readUInt8x4` counting the
+   words that hold four, `readInt4x8` / `readUInt4x8` handing back a
+   `Float4Pair` of eight nibbles, the free `unpackInt8x4` / `packInt8x4` family
+   beside them, and `int8x4FromBytes` / `int8x4ToByte` and the nibble pair on
+   the host in `PackedVertex.h`. Sign extension is written as `(b ^ 0x80) - 128`
+   in every dialect and on the host, so a buffer packed on the CPU reads back as
+   what was put in it rather than as what a cast happened to mean. The fp16
+   scale needed nothing new: `readHalf` was already exact and
+   `halfFromFloat` on the host already rounds to nearest even, which is what
+   lets the CPU reference be bit-identical to the shader rather than close to
+   it.
+
+   Then, after this tree measured the fourth round and found the shape below,
+   the same PR supplied **the wide quantized reads**: `readInt8x8` /
+   `readUInt8x8` over records of eight bytes, taken through one `read2`;
+   `readInt8x16` / `readUInt8x16` over records of sixteen, through one `read4`;
+   and `readInt4x16` / `readUInt4x16` over records of sixteen nibbles, through
+   one `read2`. Sixteen values do not fit a vector any of the three languages
+   has, so they come back as **`Float4Quad {Float4 a, b, c, d;}`** in address
+   order — `q.a.x` is the record's first element, `q.d.w` its sixteenth — beside
+   the `Float4Pair {low; high;}` the nibble reads already used. Element *k* of a
+   buffer is component *k* % 16 of `readInt8x16(k / 16)`, which is the index
+   convention `readBFloat16x4` set, one width up.
+
+   Downstream it is step 5's fourth and fifth rounds, below: `WeightStorage` has
+   its fourth case, the loader quantizes on the way up, `--int8` is the flag,
+   and `storedWeight8` / `storedWeight16` are what the split product and the
+   tiled products' staging read through. Decode went from 85 to 112 tokens/s
+   over 64 tokens on the fourth round and from 112 to 141 on the fifth, and the
+   process from 6.37 GB of footprint to 4.62 GB.
+
+   **What this tree hit while consuming it, in the order it costs.**
+
+   - **No quantized read wider than one word, which held int8 to 1.32x instead
+     of 1.88x. Filled, and it was worth 26%.** `readInt8x4(i)` fetched one word
+     — four bytes, four weights — where `readBFloat16x4(i)` fetches two words as
+     a single eight-byte load for the same four weights. So the two kernels
+     issued the same number of loads and the quantized one carried half the
+     bytes in each, and a decode step that should have been bound by bandwidth
+     was bound by load issue: 427 to 478 GB/s on the bf16 path against 298 to
+     335 GB/s on the int8 one, on the same device and the same kernel.
+
+     What landed is exactly the shape this asked for: `readInt8x8` out of the
+     two words `read2` fetches and `readInt8x16` out of the four `read4`
+     fetches, with the nibble pair at both widths and `Float4Quad` as the answer
+     to "no vector wider than four". On Metal a `readInt8x16` emits one
+     `packed_float4` load and four register bitcasts, with no second buffer
+     access, which an eacp codegen test asserts. Sixteen weights to a load also
+     makes the per-block scale a read per sixteen rather than per four.
+
+     **Measured, it is two thirds of the way to the bytes' prediction and the
+     rest is not loads.** 112.1 to 141.0 decode tokens/s over 64, 125.9 to 161.6
+     over 16, and 299 to 375 GB/s and 335 to 430 GB/s with them — against bf16's
+     433 and 479 on the same runs. What the wide read did not buy is explained
+     under "Performance shape" above: past this point both paths lie on one line
+     of 551 GB/s marginal bandwidth plus 1.36 ms of fixed per-step cost, so the
+     remaining 1.63x-against-1.88x is the dispatches and the work that is not
+     weights, and no read width reaches it.
+
+   - **No common-subexpression elimination for buffer reads. Still open, and now
+     worked around rather than paid.** The eacp side has already recorded it; it
+     showed here in the tiled products' staging loop, where a staging thread
+     reads eight consecutive weights that are all in one block and each of the
+     eight emitted its own `readHalf` of the same scale. That cost prefill
+     rather than decode — 994 tokens at 1400 tokens/s against bf16's 1426, 2%
+     — and one `readInt8x8` per run is what removes it: the run is now one
+     eight-byte load and one scale read, and the quantized prefill measures 1490
+     tokens/s, 4% *faster* than the packed path rather than 2% slower. The gap
+     itself is unchanged: two reads at the same index are still two loads, and
+     it is only that there is now a call that does in one read what eight would
+     have done.
+
+   - **No vector wider than four. Answered by an aggregate rather than by a
+     vector.** It is why `Float4Pair` exists for the nibble reads, and
+     `Float4Quad` is the same answer one width up — four `Float4`s in address
+     order, which is what a sixteen-byte load unpacks into and what every
+     backend can spell.
+
+   **What is still awkward, after the merge.** Three things, none of them
+   blocking:
+
+   - **`asUInt` is scalar only**, with no `Float4 -> UInt4` overload. It is why
+     a kernel cannot fetch four words through `read4` and bitcast them itself,
+     which is the workaround the wide reads made unnecessary rather than
+     possible — the alternative was binding the weight as a
+     `Uniform<UIntInputBuffer>`, which makes the *uniform's declared type* depend
+     on the weight's storage and so reaches every product kernel's member list
+     rather than its read.
+   - **HLSL and GLSL still expand a record read componentwise**, `read4`
+     included and so `readInt8x16` with it. The win above is Metal's alone
+     today; the same kernel is correct on D3D12 and no faster there.
+   - **There is no wide *store* to match.** The quantizer runs on the host, so
+     nothing here needs one yet; an on-device quantizer would.
+
+   Int4 is the next round and is deliberately not written here. It is a fifth
+   `WeightStorage` case reading `readInt4x16` at the same block and the same
+   scale, and nothing in the layout, the loader or the decoder's plumbing
+   changes shape for it — which is what the fourth case was designed to leave
+   true.
 
 Found while writing steps 1 and 2, unranked. **All four are filled**, on eacp
 `develop`, and all four are used here:
@@ -444,16 +580,17 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    3.6e-3 relative over the three prompts — 0.025, 0.043 and 0.013 absolute,
    on logits reaching 88.6, 113.4 and 74.9 — and 8.4e-3 one token at a time.
 
-   Two rounds of step 5 have moved them in the fourth significant digit and no
+   The rounds of step 5 have moved them in the fourth significant digit and no
    further, which is worth a table since it is the one number that says the
-   arithmetic is still the same arithmetic:
+   arithmetic is still the same arithmetic. The five columns are the first four
+   rounds; the fifth round's figures are in the paragraph after it:
 
-   | | widened F32 | packed BF16 | + the eacp round |
-   | --- | --- | --- | --- |
-   | `A:` | 8.3794e-3 | 8.3794e-3 | 8.35314e-3 |
-   | `In 1969 …` | 1.02258e-2 | 1.02258e-2 | 1.02578e-2 |
-   | `def add(a, b):` | 3.60951e-3 | 3.60951e-3 | 3.59328e-3 |
-   | one token at a time | 8.36572e-3 | 8.36572e-3 | 8.36879e-3 |
+   | | widened F32 | packed BF16 | + the eacp round | + 256 split lanes | int8 blocks |
+   | --- | --- | --- | --- | --- | --- |
+   | `A:` | 8.3794e-3 | 8.3794e-3 | 8.35314e-3 | 8.35314e-3 | **0.364406** |
+   | `In 1969 …` | 1.02258e-2 | 1.02258e-2 | 1.02578e-2 | 1.02578e-2 | **0.285007** |
+   | `def add(a, b):` | 3.60951e-3 | 3.60951e-3 | 3.59328e-3 | 3.59328e-3 | **0.242264** |
+   | one token at a time | 8.36572e-3 | 8.36572e-3 | 8.36879e-3 | 8.36665e-3 | **0.364372** |
 
    The middle column is exact against the first because the shader widens the
    same bytes in the same order. The third moved because the order changed: the
@@ -468,8 +605,51 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    That is what a 2048-wide fp32 dot product summed in two different orders
    through eighteen layers costs, and it tracks the magnitude a row reaches
    rather than anything else, so the provisional 2e-3 is now
-   `logitTolerance = 5e-2`, five times the worst of them. What changed
-   against the plan:
+   `logitTolerance = 5e-2`, five times the worst of them.
+
+   **The last column is a different kind of number, and belongs in the same
+   table for exactly that reason.** The first four move in the fourth
+   significant digit because they are the accumulation order's; the fifth is a
+   hundred times larger because it is the format's — 1.65, 2.53 and 1.39
+   absolute on logits reaching 88.6, 113.4 and 74.9. `quantizedLogitTolerance`
+   is 2.0, five times the worst of them at one digit, by the same discipline.
+
+   **And the argmax does not move.** Every row's largest token still agrees with
+   llama.cpp on all three prompts and one token at a time, and the eight-token
+   greedy continuation is the same eight tokens — ` Paris` and the four after it
+   — on the quantized path as on the exact one. What does move is the fifth
+   place: four rows of the fifty this tier compares swap their fifth token, and
+   each of those four is a pair llama.cpp's own row puts 0.196, 0.098, 0.0003
+   and 0.075 logits apart. So the top-five check is now "the same five, or a
+   swap the reference itself calls a tie", with `quantizedTieGap = 1.0` five
+   times the worst of those — and the exact storages answer to a tie gap of
+   zero, which is the strict set equality they have always passed.
+
+   **The fourth column moves one row and only one, and which row it is is the
+   point.** The split count that went from 64 lanes to 256 is the one-row
+   product's, so the three prompt rows — which go through the many-row tiled
+   product and never touch it — are identical digit for digit, and the
+   token-at-a-time row, whose every projection is that product, moves from
+   8.36879e-3 to 8.36665e-3. A fold over 256 lanes is a different tree than one
+   over 64, which is all that is, and it moves the answer by less than the
+   change from fp32 to bf16 storage did.
+
+   **The fifth round moves the same one row, for the same reason, and says so
+   twice over.** The wide read changed which sixteen weights a lane of the
+   one-row product owns and the lane count went 256 to 128 with it, so the
+   token-at-a-time rows move — 8.36665e-3 to **8.37199e-3** on the packed path
+   and 0.364372 to **0.364376** on the quantized one — while all six prompt
+   rows, packed and quantized, come back identical to the digit: 8.35314e-3,
+   1.02578e-2, 3.59328e-3 and 0.364406, 0.285007, 0.242264. The prompt rows go
+   through the tiled product, and the tiled product's staging changed too — a
+   run of eight weights out of one `readInt8x8` in place of eight reads — so
+   their being unmoved is the assertion that the wide read is the same
+   arithmetic in a different number of loads, and not merely that nothing
+   touched them. Every argmax still agrees, the greedy continuation is the same
+   eight tokens, and the four rows of fifty that swap a fifth token are the same
+   four.
+
+   What changed against the plan:
    gate and up are concatenated at load into one `[32768, 2048]` weight, so
    the MLP is one product, one GeGLU and the down product with the residual
    folded into its store; and the per-step intermediates are sized by a step
@@ -524,13 +704,17 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    0.12 s of prefill and 0.18 s of decode, about 90 tokens/s. What is left of
    that 15 s is mostly the 17.5 MB `tokenizer.json` through Miro's JSON in a
    Debug build, not the weights: the same run in Release loads in 0.9 s.
-5. **First round done: the weights stay bf16.** The BF16 read went into eacp
+5. **Five rounds done; the weights are bf16 by default and int8 on request.**
+   The first round is below, then the eacp gaps, then the three numbers that
+   were guesses, then the storage format, then the load that format needed.
+
+   **First round: the weights stay bf16.** The BF16 read went into eacp
    first, since it decides the whole memory budget, and this round is what
    consumes it. `WeightStorage` has a `PackedBFloat16` case; `MatMul`, `Linear`,
    `SplitLinear`, `TiledMatMul` and `SimdTiledMatMul` each read their weight
    through one `storedWeight` / `storedWeight4` written once in `MatMul.h`, so
-   a fourth storage would be one edit rather than five; and `Embed` became a
-   template over the same enum. The loader uploads a BF16 or an F16 tensor's
+   a fourth storage would be one edit rather than five — see the fourth round
+   for how that turned out; and `Embed` became a template over the same enum. The loader uploads a BF16 or an F16 tensor's
    bytes as they lie, padding an odd element count to a whole word, and the
    fused gate-and-up weight is stacked as bytes — see the concatenation item
    above. Everything a product reads is packed. The two RMSNorm scales per
@@ -609,17 +793,348 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
    3 — and holding the `simdSum` fold out showed that almost all of it is
    eacp's own `read4` lowering rather than anything here.
 
-   Still to do in this step: the fused GeGLU, the split counts (the decoder's
-   64 and 32 are WhisperEACP's numbers, and 32 now also buys the SIMD-scoped
-   fold, which is a reason to keep it that measurement did not supply), and the
-   prompt-capacity guess. The two gaps the bf16 round turned up are at the end
-   of the gap list, one filled and one left open.
+   **Third round: the three numbers that were still guesses.** The fused
+   GeGLU, the two split counts and the prompt capacity were the last things in
+   this step carried over from WhisperEACP or from arithmetic rather than
+   measured here. All three are settled now, by measurement. One number moved
+   — the in-layer split count, from 64 lanes to 256 — and everything else is
+   kept for a reason a measurement supplies rather than assumes, which is the
+   outcome the second round's conclusion predicts and the reason to write a
+   null result down with its figure rather than leave it as an open item.
+
+   | | was | is | what it is worth |
+   | --- | --- | --- | --- |
+   | in-layer split lanes | 64 | **256** | +2.0% at 16 tokens, +1.9% at 64 |
+   | logits split lanes | 32 | 32 | a curve flat to 0.3% either side |
+   | fused GeGLU | no | no | 0.07% of a step's bytes, 0.5% measured |
+   | prompt capacity | 512 | 512 | 0.69 s prefill against 0.79 s at 128 |
+
+   **The in-layer split count is the one that moved, and 64 was low.** It is
+   how many lanes share one output's inner sum in every projection a decode
+   step runs, and the 64 it has been is neither a measurement nor WhisperEACP's
+   own number — that one is 96, over a 384-wide row, which is not Gemma's
+   curve. Release, 6-token prompt, one M-series device, decode tokens/s, the
+   median of three interleaved rounds:
+
+   | lanes | 16 tokens | 64 tokens |
+   | --- | --- | --- |
+   | 32 | 92.8 | 83.6 |
+   | 64 — what stood here | 92.7 | 83.7 |
+   | 96 | 93.5 | 84.1 |
+   | 128 | 93.3 | 84.6 |
+   | **256** | **94.6** | **85.3** |
+   | 384 | 85.7 | 77.4 |
+   | 512 | 67.6 | 61.6 |
+   | 1024 | 29.2 | 27.3 |
+
+   Two percent, which is small and is also the only thing this round found that
+   is outside the noise. The shape of the curve is the interesting half: it is
+   nearly flat from 32 to 256 and then falls off a cliff, losing a third of the
+   rate by 512 and two thirds by 1024. 256 is eight SIMD groups, and past it a
+   group is asking the scheduler for more threads than one output's 2048-wide
+   inner sum has work for. Nothing about this contradicts the second round —
+   256 lanes move no bytes either; what they move is how much of the machine a
+   one-row product has running at once, which is the one thing a decode step
+   was short of.
+
+   **The logits count stays 32, and now for a measured reason.** At 256
+   in-layer lanes the logits projection measures 95.0 / 85.5 tokens/s at 16
+   lanes, 94.7 / 85.3 at 32, 94.0 / 85.0 at 64, 93.0 / 84.1 at 128 and
+   93.2 / 84.4 at 256 — the top of that curve is flat to within the
+   run-to-run noise, and 32 is the one point on it where a group is exactly one
+   SIMD group per output and the fold is `simdSum` with neither scratch nor a
+   barrier. So the second round's remark that 32 "now also buys the SIMD-scoped
+   fold, which is a reason to keep it that measurement did not supply" is
+   answered: measurement supplies it, by finding nothing better.
+
+   **The fused GeGLU is not worth writing, and the arithmetic said so before
+   the measurement agreed.** Today the MLP is one product over the concatenated
+   gate-and-up weight writing `[rows, 32768]`, a GeGLU folding that to
+   `[rows, 16384]`, and the down product. Per layer a decode step's one row
+   therefore writes 128 KB, reads it back, writes 64 KB and reads that back;
+   over 18 layers the whole intermediate traffic of the feed-forward is 6.9 MB,
+   against the 5.0 GB of weights the same step reads. Fusing the activation
+   into the gate-and-up product's store removes 4.6 MB of it, 0.09%; fusing it
+   into the down product's operand read removes 3.5 MB, 0.07%. Removing the
+   stage outright — the ceiling neither fusion can beat — measures 95.4
+   tokens/s against 95.1 over 16 decode tokens and 86.0 against 85.5 over 64.
+   Half a percent is what the whole dispatch, both its buffers and its barrier
+   are worth together. The two fusions are also not equally priced: the one
+   into the down product's read is the cheap one to write and would evaluate
+   the activation 2048 times per element, once per output walking that
+   16384-wide row; the one into the gate-and-up store is free at run time and
+   needs a product kernel that computes two dot products per output and folds
+   them, in the split form and the tiled form and in each of the three weight
+   storages. Recorded in `GeGLU.h` so it is not tried again, the way the
+   attention lane-count experiment is recorded in `MultiQueryAttention.h`.
+
+   **The prompt capacity stays 512 rows, and the two curves it sits between
+   are now drawn.** It sizes the logits buffer at `capacity × 256000 × 4` bytes
+   and every per-step intermediate beside it, and it is how many rows one
+   prefill block carries. Release, a 986-token prompt — long enough to be
+   several blocks at every capacity below it:
+
+   | rows | blocks | prefill | prefill rate | peak footprint |
+   | --- | --- | --- | --- | --- |
+   | 128 | 8 | 0.79 s | 1251 tokens/s | 5.48 GB |
+   | 256 | 4 | 0.76 s | 1303 tokens/s | 5.63 GB |
+   | **512** | **2** | **0.69 s** | **1434 tokens/s** | **5.94 GB** |
+   | 1024 | 1 | 0.69 s | 1433 tokens/s | 6.54 GB |
+
+   512 is where both curves stop paying. Below it the prefill costs 10% at 256
+   rows and 15% at 128, since a block is what fills the many-row tiled product
+   and a short one leaves it idle at the edges; above it the prefill does not
+   improve at all and the footprint grows by 600 MB, because 512 rows already
+   fill that product's machine. Half a gigabyte for the last 15% of a prefill
+   is the trade this takes, and a caller who wants the memory back has
+   `setPromptCapacity` and now knows what it costs. Gap 2 is unchanged by this:
+   the logits buffer at 512 rows is 524 MB and at 2048 rows would be past what
+   an `int` describes, which is why `Gemma::prepare` counts it in 64 bits.
+
+   With those three settled, what was left in this step was the storage format,
+   which is gap 6 and the round below.
+
+   **Fourth round: int8 blocks, which is the storage format.** Thirty-two
+   consecutive weights to a block along the contiguous dimension, one scale per
+   block, symmetric with no zero point, `q = round-to-nearest-even(x / scale)`
+   clamped to [-127, 127] — llama.cpp's Q8_0 shape, taken because it is the
+   well-characterised one and because a later comparison against a Q8_0 GGUF
+   stays possible. 1.0625 bytes an element against bf16's two.
+
+   **The scale is fp16 and the quantizer divides by it after it has been
+   narrowed.** fp16 because an fp32 scale is four bytes per thirty-two elements
+   rather than two, 12.5% more bytes on a step whose whole cost is bytes, and
+   because bf16's eight-bit mantissa would put visible error on the scale
+   itself. Dividing by the narrowed value rather than by `amax / 127` is what
+   makes a CPU reference *bit-exact* against the shader rather than close to it:
+   both sides multiply the same fp16 number by the same small integer, and a
+   float multiply is the same answer on every backend. llama.cpp's own Q8_0
+   divides by the unnarrowed one and stores the narrowed, so its dequantized
+   values are not the ones its quantizer aimed at; this way round they are, and
+   `Tests/Decoder`'s quantized run measures 2.5e-7 against a double-precision
+   reference over the dequantized weights — the same figure the exact paths give.
+
+   **One `GPU::Buffer` per weight, in two regions**, because a kernel that
+   needed two would need a second `InputBuffer` member and every product's
+   member list would change. The elements first, one signed byte each and four
+   to a word, in the order the tensor already has them; then one fp16 scale per
+   block, two to a word, in the same block order. Element *i* is byte *i*, its
+   block is *i* / 32, and the scale of block *b* is the half at
+   `elementCount / 2 + b`. A tensor whose contiguous dimension is not a whole
+   number of blocks, or whose element count is not a whole number of scale
+   words, is a `ModelError` naming it — every Gemma tensor passes, since the
+   contiguous dimension of a projection weight is 2048 or 16384.
+
+   **A fourth storage was one edit and a two-liner, not one edit.** `storedWeight`
+   and `storedWeight4` in `Kernels/WeightStorage.h` gained one `else if
+   constexpr` each, which is what the bf16 round's "one edit rather than five"
+   promised. What that round did not foresee is that a block format needs a
+   *second* address — where the scales begin — and the enum alone cannot supply
+   it, so the two functions grew a third parameter and each of the five products
+   grew a two-line `scaleBase()` that derives it from the shape uniforms it
+   already holds: a weight is rows × K and both are uniforms, so nothing new is
+   bound. The gather is the exception and carries one `UInt` uniform of its own,
+   because a gather knows the row it is reading and never how many rows there
+   are. For the three storages that have no scales the expression is never
+   emitted at all, since an unreferenced node in eacp's graph reaches no
+   statement.
+
+   **There is nothing to hoist in the split product's hot loop**, which is the
+   first thing to try and the answer is structural. A lane's records are
+   `splitCount * 4` elements apart, so at every split count a decode step
+   dispatches — 256 in a projection, 32 in the logits — consecutive iterations
+   are in different blocks and each reads its own scale exactly once. What
+   shares a scale is eight neighbouring lanes, and those read the same half in
+   the same cycle. Measured for its own sake by putting a constant where the
+   scale read is: 113.8 tokens/s against 109.6 over 64 decode tokens, so the
+   per-block scale is 3.8% of a step and the rest is elsewhere. Recorded in
+   `Linear.h` so it is not tried again.
+
+   **What is true between iterations was read as true within one, and that was
+   the mistake.** Nothing can be hoisted from one iteration to the next, and the
+   fifth round below hoists inside one instead: a record of sixteen weights is
+   one block, so it is one scale read rather than four, and the 3.8% is most of
+   what the eight-wide record buys where it is the record the row takes.
+
+   Release, one M-series device, 6-token prompt, warm, the median of three:
+
+   | | bf16 as shipped | int8 blocks of 32 |
+   | --- | --- | --- |
+   | load and upload | 0.858 s | **0.799 s** |
+   | prefill, 6 rows | 0.128 s | 0.113 s |
+   | decode, 16 tokens | 0.168 s, 95.3 tokens/s | 0.127 s, **125.9 tokens/s** |
+   | decode, 64 tokens | 0.751 s, 85.2 tokens/s | 0.571 s, **112.1 tokens/s** |
+   | prefill, 994 rows | 0.696 s, 1429 tokens/s | 0.710 s, 1400 tokens/s |
+   | peak resident | 10.33 GB | 8.58 GB |
+   | peak footprint | 6.37 GB | 4.62 GB |
+
+   **Decode is 1.32x where the bytes predict 1.88x, and that is gap 6's
+   finding** — the quantized read fetches one word where the bf16 read fetches
+   two, so the same load count carries half the data. See the gap for what the
+   missing call is, and the fifth round below for what it was worth: 1.63x, and
+   an explanation for the rest that is not a read width.
+
+   **Loading is faster, which was not the expectation.** Quantizing 2.506
+   billion parameters is a pass over every weight, and single-threaded it costs
+   2.77 s against the bf16 path's 0.858 s. Split across the cores — the blocks
+   are independent, so each thread takes a run of elements, reads a disjoint
+   part of the mapping and writes a disjoint part of the destination — it is
+   0.799 s, which is *under* the bf16 figure: 2.66 GB copied to the device
+   instead of 5.0 GB pays for the arithmetic and a little more. That is only
+   true warm; the first run after a boot is 3.28 s, and what is in that number
+   is the 5 GB safetensors arriving from disk.
+
+   **The 1.75 GB of footprint is less than the 2.35 GB the weights alone give
+   back**, and the difference is the staging copy: a tensor is quantized into a
+   host buffer and then uploaded, so the largest of them — the 557 MB embedding
+   — is held twice for as long as that upload takes, and the allocator does not
+   hand the pages back. Gap 3's zero-copy upload would remove it; nothing else
+   here would.
+
+   **Prefill is unchanged, and should be.** It is compute bound on the
+   SIMD-group matrix product, whose fragments load fp32 out of threadgroup
+   memory either way — all that changes is how the staging thread got the value
+   it put there. 2% slower over 994 rows, which is the eight redundant scale
+   reads per staged run of eight that the no-CSE item in gap 6 describes — and
+   which the fifth round removes, leaving the quantized prefill ahead of the
+   packed one rather than behind it.
+
+   The oracle's own column is under step 3: every argmax still agrees with
+   llama.cpp, the greedy continuation is the same eight tokens, and the
+   elementwise differences are a hundred times the bf16 path's because they are
+   the format's rather than the accumulation order's.
+
+   The two gaps the bf16 round turned up are at the end of the gap list, one
+   filled and one left open.
+
+   **Fifth round: the load, which is what the 1.32x was about.** The fourth
+   round's finding was a hypothesis with a prediction in it — the quantized walk
+   issues as many loads as the packed one for half the data, so widen the load
+   and the step goes back to being bandwidth bound, somewhere near 430 GB/s and
+   150 to 160 tokens/s over 64. eacp answered with `readInt8x8` and
+   `readInt8x16`, and this round is what consumes them and what the prediction
+   is worth.
+
+   What it is here: `Kernels/WeightStorage.h` has `storedWeight8` and
+   `storedWeight16` beside `storedWeight4`, on the same convention — the index
+   counts elements, the call site never spells how wide one is — handing back
+   eacp's `Float4Pair` and `Float4Quad` rather than an aggregate of ours, since
+   those are what the reads underneath return and a wrapper would be a copy and
+   a second name for one thing. `SplitLinear`'s hot loop walks records of
+   sixteen weights against four `read4`s of the input. The two tiled products'
+   staging thread takes its run of eight weights through one `readInt8x8`, which
+   is one load and one scale where it was eight of each.
+
+   **The record width and the lane count are one choice, and taking that apart
+   is most of what this round measured.** A row of 2048 is 128 records of
+   sixteen, so at the fourth round's 256 lanes half of them have nothing to do —
+   which is the one thing about the wide record that is not free. Three ways out
+   were on the table: drop to records of eight where the row is short of records
+   (every lane busy, twice the loads), take the sixteen and let half the lanes
+   idle, or move the lane count to where a 2048-wide row is exactly one record a
+   lane. Release, 6-token prompt, quantized weights, the median of three:
+
+   | what the split product walks | 16 tokens | 64 tokens |
+   | --- | --- | --- |
+   | records of four, 256 lanes — the fourth round | 125.9 | 112.1 |
+   | eight at K = 2048, sixteen at K = 16384, 256 lanes | 131.1 | 115.7 |
+   | sixteen wherever the row divides by it, 256 lanes | 139.1 | 122.8 |
+   | **sixteen, 128 lanes** | **161.6** | **141.0** |
+
+   The second row is the answer the utilisation argument gives and it is the
+   worst of the three: eight-wide records with every lane busy buy 3%, and
+   sixteen-wide records with half the lanes idle buy 9.4%. Fewer loads is worth
+   more than more lanes, which is the fourth round's own claim arriving from the
+   other side — so the kernel now takes the widest record the row divides by and
+   says nothing about lanes, and the lane count is where the idleness is fixed.
+
+   **`Decoder::stepSplitCount` is therefore 128, not 256**, and it is the third
+   round's measurement redone at the new record width rather than a number
+   overturned. Quantized decode tokens/s over 16 and 64, the median of three,
+   with the packed path's 64-token figure beside it to show it is flat:
+
+   | lanes | int8, 16 | int8, 64 | bf16, 64 |
+   | --- | --- | --- | --- |
+   | 64 | 160.0 | 139.7 | 85.4 |
+   | 96 | 160.0 | 139.7 | 85.4 |
+   | **128** | **161.6** | **141.3** | **87.0** |
+   | 160 | 163.3 | 141.6 | 86.5 |
+   | 192 | 156.9 | 137.3 | 86.7 |
+   | 256 | 139.1 | 122.8 | 86.8 |
+
+   128 and 160 are a tie to within the run-to-run noise, and 128 is the one of
+   the two with a reason behind it rather than a peak in it: a 2048-wide row is
+   128 records of sixteen, so every lane owns exactly one and none owns two. The
+   cliff past 256 that the third round found is still there and has moved down
+   with the record — a group is now asking for lanes a sixteen-record row has no
+   records for. `logitsSplitCount` was re-measured on the same runs and stays
+   32: 141.3 tokens/s at 16 lanes, 141.3 at 32, 139.7 at 64, which is the same
+   flat top the third round reported.
+
+   Release, one M4 Max, 6-token prompt, warm, the median of three, with the
+   weight traffic each rate comes to beside it — 5.0 GB a step packed and
+   2.66 GB quantized:
+
+   | | bf16 before | bf16 after | int8 before | int8 after |
+   | --- | --- | --- | --- | --- |
+   | load and upload | 0.839 s | 0.860 s | 0.796 s | 0.801 s |
+   | decode, 16 tokens | 94.7 tok/s, 473 GB/s | **95.8, 479 GB/s** | 126.0, 335 GB/s | **161.6, 430 GB/s** |
+   | decode, 64 tokens | 85.4, 427 GB/s | **86.5, 433 GB/s** | 112.3, 299 GB/s | **141.0, 375 GB/s** |
+   | prefill, 994 rows | 1426 tok/s | 1427 | 1400 | **1484** |
+
+   The 6-token prefill is 0.11 to 0.13 s in every one of the four and is noise
+   at that size; the footprint figures are the fourth round's, since nothing
+   about the layout or the buffers changed.
+
+   **The hypothesis was right about the mechanism and half right about the
+   number.** It predicted 430+ GB/s and 150 to 160 tokens/s over 64: the 16-token
+   run lands on 430 GB/s exactly, and the 64-token one on 375 and 141. The gap
+   between the two decode lengths is not the read's — the packed path loses the
+   same 9.5% from 16 tokens to 64 that the quantized one loses 12.7% of, and
+   what grows is the attention over a longer cache. What is genuinely left is
+   the fixed cost of a step, and the two-point arithmetic under "Performance
+   shape" separates it: after this round both paths fit one line of 551 GB/s
+   marginal bandwidth plus 1.36 ms a step, where before the round they fit no
+   line at all. So the quantized read is now bandwidth bound at the same
+   bandwidth the packed one gets, 1.63x rather than 1.88x, and the missing 0.25
+   is a couple of hundred dispatches and the work that is not weights.
+
+   **The packed path takes the wide record too, and is 1.3% faster for it.**
+   bf16 has no wider load to reach for — eight bytes is already the whole of a
+   `readBFloat16x4` — so `storedWeight16` for it is four of those, the same
+   loads it issued before. It was measured in case the restructured loop cost
+   something: 94.7 to 95.8 tokens/s over 16 and 85.4 to 86.5 over 64, which is
+   1.2% and a shade above the noise, the wrong side of zero to bother gating, so
+   bf16 stays on the wide path rather than keeping a four-wide loop of its own.
+
+   **Prefill turned round, and the no-CSE item is why.** The fourth round left
+   the quantized prefill 2% behind the packed one — 1400 tokens/s against 1426
+   over 994 rows — because each staging thread read the same block scale eight
+   times. One `readInt8x8` per run makes it one load and one scale, and the
+   quantized prefill is now 1484 tokens/s, 4% *ahead* of the packed path rather
+   than 2% behind it, and the packed path itself is unmoved at 1427. The
+   SIMD-group matrix is untouched: the fragment still loads fp32 out of
+   threadgroup memory, and all that changed is how the staging thread got the
+   value it put there.
+
+   **One thing cost 6% before it was noticed, and it is worth writing down.**
+   The wide staging read has to be a run of its own, since eight weights come
+   out of one call, where the loop it replaced staged an element of A and an
+   element of B together. Making that split unconditionally — the same
+   arithmetic, the same reads, for the packed and float storages as well — cost
+   the packed path 6% of a 994-row prefill, 1426 tokens/s down to 1338. So
+   `SimdTiledMatMulProgram` keeps the interleaved staging for the storages that
+   have no wide read to take, and only the quantized one is lifted out. Nothing
+   about the arithmetic says which is faster; the scheduler does, and the only
+   way to find out was to measure the path that was supposed to be unchanged.
 6. **Half done.** `Sampling` is the CPU sampler — temperature, top-k, top-p in
    Hugging Face's processor order, a seeded draw the standard specifies so a
    seed means the same token sequence on every machine — and a temperature
    above zero routes the loop through a 1 MB logits readback per token, one
    step in flight. `Apps/Console/Generate` streams a continuation for a prompt
-   and prints the two halves' timings. On-device sampling is a later round.
+   and prints the two halves' timings, the storage its weights ended up in, and
+   takes `--int8` to ask for the quantized one. On-device sampling is a later
+   round.
 
 ## Open decisions
 
@@ -647,5 +1162,26 @@ Mirrors how WhisperEACP went, one module and one test tier at a time:
   codegen one: the packed fragment load needs Metal 3.1, which is macOS 14,
   against eacp's floor of 11. Raise the floor, gate it and document a barrier
   that exists on one OS and not the other, or expose a feature level a kernel
-  asks — the three are spelled out under the gap itself. Nothing here needs it
-  before quantization, which changes the operand format again anyway.
+  asks — the three are spelled out under the gap itself.
+
+  **Quantization has now happened and has not answered it.** The int8 round
+  leaves the SIMD-group matrix exactly where it was: the fragment still loads
+  fp32 out of threadgroup memory, and the staging thread widens a byte and a
+  scale instead of a bf16. So the ask is the same ask at a different width — a
+  fragment loaded straight out of a quantized device buffer — and it is still a
+  deployment-target question. What did change is the cost of not having it, and
+  it has changed sign: the fourth round left prefill 2% slower on the quantized
+  path than the packed one, and the fifth round's `readInt8x8` in the staging
+  makes it 4% faster — 1484 tokens/s against 1427 over 994 rows. So the
+  staging, which is the only place the two paths differ, is no longer what a
+  quantized prefill loses on, and a fragment loaded straight out of a quantized
+  buffer would now be an ask for the packed path's sake as much as the
+  quantized one's.
+- **Should `--int8` be the default?** It is not, and the case either way is now
+  a measurement rather than a guess: 1.63x the decode rate and 1.75 GB less
+  footprint against elementwise logit differences a hundred times larger, an
+  argmax that has not moved on any row this tier compares, and a fifth-place
+  token that swaps on four rows of fifty. A base completion model at greedy
+  temperature is unaffected; something that reads the tail of the distribution —
+  top-p, a beam, a scoring run — is the case that would notice. Left as the
+  caller's, which is what `setWeightPrecision` and the flag are.

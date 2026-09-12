@@ -55,7 +55,7 @@ struct EmbedProgram final : ComputeProgram
 
         auto token = tokens[step];
         auto element = token * width + channel;
-        auto gathered = storedWeight<tableStorage>(tokenTable, element);
+        auto gathered = storedWeight<tableStorage>(tokenTable, element, blockScales);
 
         write(output, step * width + channel, scale * gathered);
     }
@@ -66,10 +66,18 @@ struct EmbedProgram final : ComputeProgram
     Uniform<UInt> width;
     Uniform<Float> scale;
 
-    EACP_SHADER(tokens, tokenTable, output, width, scale)
+    // Where a quantized table's per-block scales begin, in halves: vocabulary *
+    // width / 2. It is a uniform here and derived from the shape elsewhere
+    // because this is the one kernel whose uniforms do not already carry its
+    // weight's element count — a gather knows the row it is reading and never
+    // how many rows there are. Zero, and unread, in the other three storages.
+    Uniform<UInt> blockScales;
+
+    EACP_SHADER(tokens, tokenTable, output, width, scale, blockScales)
 };
 
 using Embed = EmbedProgram<WeightStorage::Float>;
 using HalfWeightEmbed = EmbedProgram<WeightStorage::PackedHalf>;
 using BFloat16WeightEmbed = EmbedProgram<WeightStorage::PackedBFloat16>;
+using Int8WeightEmbed = EmbedProgram<WeightStorage::Int8Blocks>;
 } // namespace HF
