@@ -2,7 +2,12 @@ add_library(hf-model STATIC)
 
 # Miro rides along on eacp-core, which hf-core links through eacp-gpu, so
 # <Miro/Json.h> needs no dependency of its own here.
-target_link_libraries(hf-model PUBLIC hf-core)
+#
+# hf-kernels is PRIVATE and is one function: Kernels/Int8Blocks.h is where the
+# quantized layout is defined, because it is defined by the read that consumes
+# it, and TensorLoader writes that layout. Nothing in this module's own
+# signatures names a kernel.
+target_link_libraries(hf-model PUBLIC hf-core PRIVATE hf-kernels)
 
 target_sources(hf-model PRIVATE
         GemmaConfig.cpp
@@ -43,11 +48,10 @@ set(HF_EACP_GEMMA_MODEL_DIR "${CMAKE_BINARY_DIR}/gemma-2b"
 # tokenizer, the same config numbers — and pinning the revision is what keeps
 # the hashes below valid when the mirror moves.
 #
-# Google's own download is still reachable, through the GEMMA_MODEL_DIR
-# override that ModelFiles.h documents. That is the one that carries
-# gemma-2b.gguf beside the safetensors, which is what Tests/Oracle reads, so a
-# machine that has done the gated download by hand keeps every test the mirror
-# cannot serve.
+# The one file the mirror cannot serve is gemma-2b.gguf, which Tests/Oracle
+# reads. It is not a download at all any more: llama.cpp's own converter writes
+# it from the files fetched here, and the GEMMA_MODEL_DIR override that
+# ModelFiles.h documents is how a machine that has run that says where it went.
 set(GEMMA_2B_URL "https://huggingface.co/unsloth/gemma-2b/resolve/\
 7ac9d201a57c8cdc6f939069fc0f044c60197a4a")
 

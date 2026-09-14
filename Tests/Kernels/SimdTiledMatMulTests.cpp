@@ -93,24 +93,50 @@ auto tSimdTiledLinearPackedWeights =
     TiledProduct::checkPackedLinear<HalfWeightSimdTiledLinear>(100, 45, 76, 410u);
 };
 
-// Gemma's own storage through the product a prompt spends its time in, and
-// against the float product bit for bit — see checkPackedBFloat16Linear. The
-// second shape is 2048 deep, which is the model's width and a long enough sum
-// that a widening that was not exact would show.
+// The bf16 form of the same product, which is what Gemma's own weights are read
+// through: the checkpoint is narrowed by eacp's host packer and the reference
+// runs on what that leaves, so the two agree to float32 accumulation rather
+// than to bf16's three digits. The odd inner extent puts a weight row's last
+// element in the high half of a word and the next row's first in a new one.
 auto tSimdTiledLinearBFloat16Weights =
     test("Kernels/simdTiledLinearBFloat16Weights") = []
 {
     if (!Device::shared().isValid())
         return;
 
-    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
-                                            SimdTiledLinear>(37, 21, 35, 400u);
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        37, 21, 35, 400u, TiledProduct::packedBFloat16s);
 
-    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
-                                            SimdTiledLinear>(100, 45, 76, 410u);
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        100, 45, 76, 410u, TiledProduct::packedBFloat16s);
 
-    TiledProduct::checkPackedBFloat16Linear<BFloat16WeightSimdTiledLinear,
-                                            SimdTiledLinear>(64, 2048, 256, 420u);
+    TiledProduct::checkPackedLinear<BFloat16WeightSimdTiledLinear>(
+        128, 64, 128, 420u, TiledProduct::packedBFloat16s);
+};
+
+// The quantized form through the SIMD-group matrix, which is the product a
+// prefill takes on Metal: the fragment still loads fp32 out of threadgroup
+// memory, so what changes is only how the staging thread got the value it put
+// there — eight bytes and the one block scale they share, out of a single
+// readInt8x8, rather than eight widened bf16s.
+auto tSimdTiledLinearInt8Weights = test("Kernels/simdTiledLinearInt8Weights") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        37, 32, 34, 430u, TiledProduct::quantizedInt8Blocks);
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        100, 64, 76, 440u, TiledProduct::quantizedInt8Blocks);
+
+    TiledProduct::checkPackedLinear<Int8WeightSimdTiledLinear>(
+        128, 128, 128, 450u, TiledProduct::quantizedInt8Blocks);
+
+    // A prefix of each row, so a staging run of eight straddles the inner
+    // extent and the wide quantized read gives way to the loop beside it.
+    TiledProduct::checkPackedLinearOverPrefix<Int8WeightSimdTiledLinear>(
+        100, 40, 64, 76, 460u, TiledProduct::quantizedInt8Blocks);
 };
 
 // The batch fold and the causal mask together: one batch per head over the

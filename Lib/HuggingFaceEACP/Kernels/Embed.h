@@ -1,6 +1,6 @@
 #pragma once
 
-#include "KernelTypes.h"
+#include "WeightStorage.h"
 
 namespace HF
 {
@@ -37,11 +37,11 @@ namespace HF
 // without a trip through the host: a vocabulary is indexed, not measured, and
 // the buffer's element type says so on both backends.
 //
-// The table is the one operand a checkpoint decides the storage of, and it is
-// the same buffer the tied logits product reads — so this reads it in whatever
-// the loader left it in, which for Gemma is packed bfloat16. A gather is a
-// read and a multiply whatever the element is, so the three forms differ only
-// in the buffer bound to tokenTable.
+// The table takes a WeightStorage for the reason the products do, and it is the
+// tied embedding that asks: the same buffer is the gather's table and the
+// logits projection's weight, so a gather with only a float form would have
+// forced the largest tensor in the model to be widened however the product read
+// it. storedWeight is the same widening either kernel does.
 template <WeightStorage tableStorage>
 struct EmbedProgram final : ComputeProgram
 {
@@ -54,18 +54,10 @@ struct EmbedProgram final : ComputeProgram
         auto step = position.y;
 
         auto token = tokens[step];
+        auto element = token * width + channel;
+        auto gathered = storedWeight<tableStorage>(tokenTable, element, blockScales);
 
-        write(output, step * width + channel, scale * row(token * width + channel));
-    }
-
-    Float row(const UInt& index)
-    {
-        if constexpr (tableStorage == WeightStorage::PackedHalf)
-            return tokenTable.readHalf(index);
-        else if constexpr (tableStorage == WeightStorage::PackedBFloat16)
-            return tokenTable.readBFloat16(index);
-        else
-            return tokenTable[index];
+        write(output, step * width + channel, scale * gathered);
     }
 
     Uniform<UIntInputBuffer> tokens;
@@ -74,10 +66,18 @@ struct EmbedProgram final : ComputeProgram
     Uniform<UInt> width;
     Uniform<Float> scale;
 
-    EACP_SHADER(tokens, tokenTable, output, width, scale)
+    // Where a quantized table's per-block scales begin, in halves: vocabulary *
+    // width / 2. It is a uniform here and derived from the shape elsewhere
+    // because this is the one kernel whose uniforms do not already carry its
+    // weight's element count — a gather knows the row it is reading and never
+    // how many rows there are. Zero, and unread, in the other three storages.
+    Uniform<UInt> blockScales;
+
+    EACP_SHADER(tokens, tokenTable, output, width, scale, blockScales)
 };
 
 using Embed = EmbedProgram<WeightStorage::Float>;
 using HalfWeightEmbed = EmbedProgram<WeightStorage::PackedHalf>;
 using BFloat16WeightEmbed = EmbedProgram<WeightStorage::PackedBFloat16>;
+using Int8WeightEmbed = EmbedProgram<WeightStorage::Int8Blocks>;
 } // namespace HF

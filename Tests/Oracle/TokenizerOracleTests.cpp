@@ -48,6 +48,10 @@ const auto textCases = std::vector<std::string> {
     "line one\nline two\n",
     "\tone tab",
     "The capital of France is",
+    // The probe the decoder and generation tests run on. It is fed to the
+    // model through our tokenizer on one side and llama.cpp's on the other, so
+    // the three witnesses only compare if this case agrees.
+    "Q: What is the capital of France?\nA:",
 };
 
 bool canRun()

@@ -5,7 +5,6 @@
 
 #include <eacp/GPU/GPU.h>
 
-#include <cstring>
 #include <string>
 
 namespace HF
@@ -36,126 +35,110 @@ const DecoderShape& validated(const DecoderShape& shape)
 }
 
 TensorBuffer loadTokenEmbedding(const ShardedTensors& file,
-                                const DecoderShape& shape)
+                                const DecoderShape& shape,
+                                WeightPrecision precision)
 {
-    return decoderTensors(file).loadWeight(GemmaTensors::embedding,
-                                           {shape.vocabularySize, shape.width});
-}
-
-// Whether a kernel reads this storage as pairs in a word rather than as floats
-// it subscripts, which is what decides whether the two halves below can be
-// joined as the bytes they already are.
-bool isPackedPair(TensorType type)
-{
-    return type == TensorType::F16 || type == TensorType::BF16;
-}
-
-template <typename Element>
-eacp::GPU::Buffer uploadStacked(Span<const Element> first,
-                                Span<const Element> second)
-{
-    auto stacked = Vector<Element> {};
-    stacked.resize(first.size() + second.size());
-
-    std::memcpy(stacked.data(), first.data(), sizeof(Element) * first.size());
-    std::memcpy(stacked.data() + first.size(),
-                second.data(),
-                sizeof(Element) * second.size());
-
-    return eacp::GPU::Device::shared().makeBuffer(stacked.data(),
-                                                  (int) sizeof(Element)
-                                                      * stacked.size(),
-                                                  eacp::GPU::BufferUsage::Storage);
+    return decoderTensors(file).loadProjectionWeight(
+        GemmaTensors::embedding, {shape.vocabularySize, shape.width}, precision);
 }
 
 // gate_proj and up_proj stacked into the one [2 * intermediate, width] weight
 // the feed-forward's single product reads, gate rows first — which is the
 // halving of a row GeGLU's primary form is written against.
-//
-// Both are checked at their shipped shapes before a byte is read, so a
-// checkpoint whose gate and up disagree is a ModelError naming the tensor
-// rather than a stack of two matrices of different widths.
-//
-// The stack is of the raw bytes when the two arrive in the same packed
-// storage, so the layer's largest weight is joined without being widened to be
-// joined — the whole point of reading bf16 packed, since this is the tensor a
-// widening would cost the most. Two 16-bit values share a word, so the up
-// rows can only start where the gate rows end if the gate half is a whole
-// number of words; an odd half, which no real shape has, widens instead.
-TensorBuffer
-    loadFusedGateUp(const ShardedTensors& file, const DecoderShape& shape, int index)
+TensorBuffer loadFusedGateUp(const ShardedTensors& file,
+                             const DecoderShape& shape,
+                             int index,
+                             WeightPrecision precision)
 {
-    const auto tensors = TensorLoader {file, layerComponent(index)};
-    const auto gateName =
-        GemmaTensors::layerTensorName(index, GemmaTensors::gateProjection);
-    const auto upName =
-        GemmaTensors::layerTensorName(index, GemmaTensors::upProjection);
-
-    const auto& gate = tensors.require(gateName);
-    const auto& up = tensors.require(upName);
-
-    tensors.checkShape(gate, {shape.intermediate, shape.width});
-    tensors.checkShape(up, {shape.intermediate, shape.width});
-
-    const auto halfCount = shape.intermediate * shape.width;
-
-    if (gate.type == up.type && isPackedPair(gate.type) && halfCount % 2 == 0)
-        return {uploadStacked(file.rawBytes(gateName), file.rawBytes(upName)),
-                gate.type};
-
-    auto stacked = Vector<float> {};
-    stacked.resize(2 * halfCount);
-
-    file.readFloats(gateName, Span<float> {stacked.data(), halfCount});
-    file.readFloats(upName, Span<float> {stacked.data() + halfCount, halfCount});
-
-    auto buffer =
-        eacp::GPU::Device::shared().makeBuffer(stacked.data(),
-                                               (int) sizeof(float) * stacked.size(),
-                                               eacp::GPU::BufferUsage::Storage);
-
-    return {std::move(buffer), TensorType::F32};
+    return TensorLoader {file, layerComponent(index)}.loadStackedProjectionWeights(
+        GemmaTensors::layerTensorName(index, GemmaTensors::gateProjection),
+        GemmaTensors::layerTensorName(index, GemmaTensors::upProjection),
+        {shape.intermediate, shape.width},
+        precision);
 }
 } // namespace
 
 DecoderLayerWeights::DecoderLayerWeights(const ShardedTensors& file,
                                          const DecoderShape& shape,
-                                         int index)
+                                         int index,
+                                         WeightPrecision precision)
     : inputNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::inputNorm),
           {shape.width}))
-    , query(TensorLoader {file, layerComponent(index)}.loadWeight(
+    , query(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::queryProjection),
-          {shape.queryWidth(), shape.width}))
-    , key(TensorLoader {file, layerComponent(index)}.loadWeight(
+          {shape.queryWidth(), shape.width},
+          precision))
+    , key(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::keyProjection),
-          {shape.kvWidth(), shape.width}))
-    , value(TensorLoader {file, layerComponent(index)}.loadWeight(
+          {shape.kvWidth(), shape.width},
+          precision))
+    , value(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::valueProjection),
-          {shape.kvWidth(), shape.width}))
-    , output(TensorLoader {file, layerComponent(index)}.loadWeight(
+          {shape.kvWidth(), shape.width},
+          precision))
+    , output(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::outputProjection),
-          {shape.width, shape.queryWidth()}))
-    , fusedGateUp(loadFusedGateUp(file, shape, index))
-    , down(TensorLoader {file, layerComponent(index)}.loadWeight(
+          {shape.width, shape.queryWidth()},
+          precision))
+    , fusedGateUp(loadFusedGateUp(file, shape, index, precision))
+    , down(TensorLoader {file, layerComponent(index)}.loadProjectionWeight(
           GemmaTensors::layerTensorName(index, GemmaTensors::downProjection),
-          {shape.width, shape.intermediate}))
+          {shape.width, shape.intermediate},
+          precision))
     , postAttentionNorm(TensorLoader {file, layerComponent(index)}.loadFloatTensor(
           GemmaTensors::layerTensorName(index, GemmaTensors::postAttentionNorm),
           {shape.width}))
 {
 }
 
+WeightStorage weightStorageOf(const TensorBuffer& weight)
+{
+    if (weight.isInt8Blocks())
+        return WeightStorage::Int8Blocks;
+
+    if (weight.isPackedHalf())
+        return WeightStorage::PackedHalf;
+
+    if (weight.isPackedBFloat16())
+        return WeightStorage::PackedBFloat16;
+
+    return WeightStorage::Float;
+}
+
 DecoderWeights::DecoderWeights(const ShardedTensors& file,
-                               const DecoderShape& shapeToUse)
+                               const DecoderShape& shapeToUse,
+                               WeightPrecision precision)
     : shape(validated(shapeToUse))
-    , tokenEmbedding(loadTokenEmbedding(file, shapeToUse))
+    , tokenEmbedding(loadTokenEmbedding(file, shapeToUse, precision))
     , finalNorm(decoderTensors(file).loadFloatTensor(GemmaTensors::finalNorm,
                                                      {shapeToUse.width}))
 {
     layers.reserve(shapeToUse.layers);
 
     for (auto index = 0; index < shapeToUse.layers; ++index)
-        layers.emplace_back(file, shapeToUse, index);
+        layers.emplace_back(file, shapeToUse, index, precision);
+}
+
+Vector<WeightStorage> DecoderWeights::storages() const
+{
+    auto found = Vector<WeightStorage> {};
+
+    auto note = [&](const TensorBuffer& weight)
+    { found.addIfNotThere(weightStorageOf(weight)); };
+
+    note(tokenEmbedding);
+
+    for (const auto& layer: layers)
+    {
+        note(layer.query);
+        note(layer.key);
+        note(layer.value);
+        note(layer.output);
+        note(layer.fusedGateUp);
+        note(layer.down);
+    }
+
+    return found;
 }
 } // namespace HF

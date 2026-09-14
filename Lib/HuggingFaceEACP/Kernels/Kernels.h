@@ -28,6 +28,7 @@
 #include "Embed.h"
 #include "GeGLU.h"
 #include "Gelu.h"
+#include "Int8Blocks.h"
 #include "KernelTypes.h"
 #include "Linear.h"
 #include "Masking.h"
@@ -39,3 +40,4 @@
 #include "SimdTiledMatMul.h"
 #include "Softmax.h"
 #include "TiledMatMul.h"
+#include "WeightStorage.h"

@@ -92,7 +92,8 @@ option(HF_EACP_ENABLE_LLAMA_CPP
 # Off by default, and it only means anything with the tests in the tree, since
 # Tests/Oracle is the only thing that links it. Both halves are expensive in a
 # way the rest of this build is not: llama.cpp and ggml are minutes of compile,
-# and the GGUF the tests read is a 10 GB manual download.
+# and the GGUF the tests read is 10 GB converted by hand out of the fetched
+# safetensors, with this tree's own convert_hf_to_gguf.py.
 #
 # Fetched here rather than inside Tests/Oracle because llama.cpp's targets are
 # named globally, so a tree holds one build of it however many directories end

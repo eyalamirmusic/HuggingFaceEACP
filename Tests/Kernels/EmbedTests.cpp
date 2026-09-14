@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "TiledProduct.h"
 
 using namespace nano;
 using namespace HF;
@@ -35,28 +36,6 @@ Vector<float> runEmbed(const Vector<std::uint32_t>& tokens,
     auto kernel = Embed {};
     kernel.tokens = tokenBuffer;
     kernel.tokenTable = tokenTableBuffer;
-    kernel.output = output;
-    kernel.width = (unsigned) width;
-    kernel.scale = scale;
-
-    return runOverGrid(kernel, output, width, tokens.size());
-}
-
-// The same gather over a table left packed, which is what the tied embedding
-// is: the logits product reads the buffer this reads, so one of them reading
-// it widened would mean a second copy of the largest tensor in the model.
-template <typename Program>
-Vector<float> runPackedEmbed(const Vector<std::uint32_t>& tokens,
-                             const eacp::GPU::Buffer& tokenTable,
-                             int width,
-                             float scale)
-{
-    auto tokenBuffer = storageOf(tokens);
-    auto output = outputFor(tokens.size() * width);
-
-    auto kernel = Program {};
-    kernel.tokens = tokenBuffer;
-    kernel.tokenTable = tokenTable;
     kernel.output = output;
     kernel.width = (unsigned) width;
     kernel.scale = scale;
@@ -185,6 +164,131 @@ auto tEmbedReadsWholeVocabularyExactly =
                   == (float) tokens[step] + 0.25f * (float) column);
 };
 
+// The packed table, which is what the tied embedding is once the checkpoint's
+// bf16 rows go up as they lie: the gather has to widen exactly what the logits
+// product widens, since the two read the same buffer. The reference runs on the
+// narrowed values, so what this asserts is the gather's indexing — a row picked
+// out of a buffer whose elements are half the width its index counts in.
+//
+// An odd model width, so a row starts in the high half of a word as often as in
+// the low one and a gather that assumed rows begin on word boundaries fails.
+auto tBFloat16WeightEmbedMatchesCpu =
+    test("Kernels/bfloat16WeightEmbedMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto width = 5;
+    constexpr auto smallVocabulary = 13;
+
+    auto tokens = tokensOf({7, 0, 12, 3, 3, 11});
+    auto values = spreadValues(smallVocabulary * width, 4242u, 2.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
+
+    auto tokenBuffer = storageOf(tokens);
+    auto tableBuffer = storageOf(packed);
+    auto output = outputFor(tokens.size() * width);
+
+    auto kernel = BFloat16WeightEmbed {};
+    kernel.tokens = tokenBuffer;
+    kernel.tokenTable = tableBuffer;
+    kernel.output = output;
+    kernel.width = (unsigned) width;
+    kernel.scale = gemmaScale;
+
+    auto result = runOverGrid(kernel, output, width, tokens.size());
+    auto expected = embedReference(tokens, widened, width, gemmaScale);
+
+    check(result.size() == expected.size());
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-6));
+};
+
+// The fp16 table the same way, for a converted repo that ships one. The two
+// packings are not interchangeable — bf16 has eight exponent bits and fp16 five
+// — which is why each has a program of its own rather than a flag, and why the
+// one Gemma does not ship is still worth a gather of its own here.
+auto tHalfWeightEmbedMatchesCpu = test("Kernels/halfWeightEmbedMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto width = 5;
+    constexpr auto smallVocabulary = 13;
+
+    auto tokens = tokensOf({7, 0, 12, 3, 3, 11});
+    auto values = spreadValues(smallVocabulary * width, 4242u, 2.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedHalves(values, widened);
+
+    auto tokenBuffer = storageOf(tokens);
+    auto tableBuffer = storageOf(packed);
+    auto output = outputFor(tokens.size() * width);
+
+    auto kernel = HalfWeightEmbed {};
+    kernel.tokens = tokenBuffer;
+    kernel.tokenTable = tableBuffer;
+    kernel.output = output;
+    kernel.width = (unsigned) width;
+    kernel.scale = gemmaScale;
+
+    auto result = runOverGrid(kernel, output, width, tokens.size());
+    auto expected = embedReference(tokens, widened, width, gemmaScale);
+
+    check(result.size() == expected.size());
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-6));
+};
+
+// The quantized table, which is the tied embedding once the loader has
+// quantized the checkpoint. The gather is the one kernel told where its scales
+// begin rather than working it out — see EmbedProgram::blockScales — so this is
+// as much about that uniform as about the byte read: a gather that ignored it
+// would read a scale out of the quantized bytes and produce numbers.
+//
+// A width of 32 is one whole block to a row, which is what the format asks of
+// the contiguous dimension; the vocabulary is 14 so the table is a whole number
+// of scale words.
+auto tInt8WeightEmbedMatchesCpu = test("Kernels/int8WeightEmbedMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto width = 32;
+    constexpr auto smallVocabulary = 14;
+
+    auto tokens = tokensOf({7, 0, 13, 3, 3, 11});
+    auto values = spreadValues(smallVocabulary * width, 4343u, 2.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto tokenBuffer = storageOf(tokens);
+    auto tableBuffer = storageOf(packed);
+    auto output = outputFor(tokens.size() * width);
+
+    auto kernel = Int8WeightEmbed {};
+    kernel.tokens = tokenBuffer;
+    kernel.tokenTable = tableBuffer;
+    kernel.output = output;
+    kernel.width = (unsigned) width;
+    kernel.scale = gemmaScale;
+    kernel.blockScales = (unsigned) (smallVocabulary * width / 2);
+
+    auto result = runOverGrid(kernel, output, width, tokens.size());
+    auto expected = embedReference(tokens, widened, width, gemmaScale);
+
+    check(result.size() == expected.size());
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-6));
+};
+
 // The shape a decode step has: one token, the model's own width, through the
 // same pipeline the prompt's many rows went through.
 auto tEmbedOneRowAtModelWidth = test("Kernels/embedOneRowAtModelWidth") = []
@@ -212,68 +316,4 @@ auto tEmbedOneRowAtModelWidth = test("Kernels/embedOneRowAtModelWidth") = []
         // reaches the gather.
         check(oneResult[i] == manyResult[i]);
     }
-};
-
-// Gemma's own storage, which the embedding keeps all the way to the device:
-// the gather over a bf16 table against the float gather over the same values
-// widened, bit for bit rather than to a tolerance, since widening a bf16 is a
-// shift and a bitcast and the multiply that follows is the same float32
-// multiply either way.
-//
-// A row width that is odd, so a row begins in the high half of a word as often
-// as in the low one and a gather that assumed one or the other fails.
-auto tBFloat16EmbedMatchesTheFloatGather =
-    test("Kernels/bfloat16EmbedMatchesTheFloatGather") = []
-{
-    if (!Device::shared().isValid())
-        return;
-
-    constexpr auto width = 5;
-    constexpr auto smallVocabulary = 13;
-
-    auto tokens = tokensOf({7, 0, 12, 3, 3, 11});
-    auto table = spreadValues(smallVocabulary * width, 4242u, 2.f);
-
-    auto widened = Vector<float> {};
-    auto packed = packedBFloat16Storage(table, widened);
-
-    auto result =
-        runPackedEmbed<BFloat16WeightEmbed>(tokens, packed, width, gemmaScale);
-
-    auto expected = embedReference(tokens, widened, width, gemmaScale);
-    auto floatResult = runEmbed(tokens, widened, width, gemmaScale);
-
-    check(result.size() == expected.size());
-
-    for (auto i = 0; i < result.size(); ++i)
-    {
-        check(isClose(result[i], expected[i], 1e-6));
-        check(result[i] == floatResult[i]);
-    }
-};
-
-// The fp16 table the same way, for a converted repo that ships one. The two
-// packings are not interchangeable — bf16 has eight exponent bits and fp16
-// five — which is why each has a program of its own rather than a flag.
-auto tHalfWeightEmbedMatchesTheFloatGather =
-    test("Kernels/halfWeightEmbedMatchesTheFloatGather") = []
-{
-    if (!Device::shared().isValid())
-        return;
-
-    constexpr auto width = 5;
-    constexpr auto smallVocabulary = 13;
-
-    auto tokens = tokensOf({7, 0, 12, 3, 3, 11});
-    auto table = spreadValues(smallVocabulary * width, 4242u, 2.f);
-
-    auto widened = Vector<float> {};
-    auto packed = packedHalfStorage(table, widened);
-
-    auto result = runPackedEmbed<HalfWeightEmbed>(tokens, packed, width, gemmaScale);
-
-    auto floatResult = runEmbed(tokens, widened, width, gemmaScale);
-
-    for (auto i = 0; i < result.size(); ++i)
-        check(result[i] == floatResult[i]);
 };

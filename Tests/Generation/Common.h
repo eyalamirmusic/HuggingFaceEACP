@@ -180,8 +180,10 @@ class SyntheticModel
 {
 public:
     explicit SyntheticModel(
-        std::string_view name, TensorEdit edit = [](Vector<SyntheticTensor>&) {})
-        : synthetic(name, Sharding::Single, std::move(edit))
+        std::string_view name,
+        TensorEdit edit = [](Vector<SyntheticTensor>&) {},
+        GemmaConfig configToUse = smallGemmaConfig())
+        : synthetic(name, Sharding::Single, std::move(edit), configToUse)
     {
         auto out = std::ofstream {synthetic.path() / ModelFileNames::tokenizerJson,
                                   std::ios::binary | std::ios::trunc};
@@ -242,16 +244,18 @@ struct ReferenceGeneration
     std::vector<Vector<float>> rows;
 };
 
-inline ReferenceGeneration referenceGenerate(const SyntheticCheckpoint& checkpoint,
-                                             const DecoderShape& shape,
-                                             const std::vector<int>& prompt,
-                                             int tokenLimit,
-                                             TokenId endOfSequence)
+inline ReferenceGeneration
+    referenceGenerate(const SyntheticCheckpoint& checkpoint,
+                      const DecoderShape& shape,
+                      const std::vector<int>& prompt,
+                      int tokenLimit,
+                      TokenId endOfSequence,
+                      WeightPrecision precision = WeightPrecision::AsShipped)
 {
     const auto rowLength = shape.logitElementCount();
     const auto capacity = shape.stepRowCapacity();
 
-    auto run = DecoderRun {shape, checkpoint.weights()};
+    auto run = DecoderRun {shape, checkpoint.weights(), precision};
     auto result = StepResult {};
     auto rowCount = 0;
 

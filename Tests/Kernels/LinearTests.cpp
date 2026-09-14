@@ -128,56 +128,6 @@ Vector<float> widenedHalves(int count)
     return values;
 }
 
-// bfloat16 with a normal exponent, both signs, and a mantissa walking its whole
-// seven-bit field — the same sweep as halfPattern over the other 16-bit float.
-// 0x3F00 is the exponent of a value in [0.5, 1), which is where a normalised
-// weight lives.
-std::uint16_t bfloat16Pattern(int index)
-{
-    const auto sign = index % 2 == 0 ? 0x0000u : 0x8000u;
-    const auto mantissa = (unsigned) ((index * 37) % 128);
-
-    return (std::uint16_t) (sign | 0x3F00u | mantissa);
-}
-
-// bfloat16 is the top sixteen bits of a float32 and nothing else, so this is
-// the widening written from its definition rather than out of the call the
-// kernel makes.
-float widenedBFloat16(std::uint16_t bits)
-{
-    const auto word = (std::uint32_t) bits << 16;
-    auto value = 0.f;
-
-    std::memcpy(&value, &word, sizeof(value));
-
-    return value;
-}
-
-Buffer packedBFloat16Buffer(int count)
-{
-    auto bytes = Vector<std::uint8_t> {};
-    bytes.resize(((count + 1) / 2) * 4);
-
-    for (auto index = 0; index < count; ++index)
-    {
-        const auto bits = bfloat16Pattern(index);
-        std::memcpy(bytes.data() + index * 2, &bits, sizeof(bits));
-    }
-
-    return Device::shared().makeBuffer(
-        bytes.data(), bytes.size(), BufferUsage::Storage);
-}
-
-Vector<float> widenedBFloat16s(int count)
-{
-    auto values = sized(count);
-
-    for (auto index = 0; index < count; ++index)
-        values[index] = widenedBFloat16(bfloat16Pattern(index));
-
-    return values;
-}
-
 // None of the three equal, none a multiple of the 8 x 8 dispatch group, so a
 // kernel that confused the weight's output stride for its input stride, or
 // leaned on the grid landing exactly on the matrix, fails here rather than on
@@ -347,11 +297,10 @@ auto tHalfWeightLinearMatchesCpu = test("Kernels/halfWeightLinearMatchesCpu") = 
         check(isClose(result[i], expected[i], 1e-5));
 };
 
-// The storage Gemma ships, over the same shapes, and against the float program
-// as well as against the reference: widening a bf16 is a shift and a bitcast,
-// so the two programs sum identical numbers in identical order and have to
-// agree bit for bit rather than to a tolerance. An odd element count again, so
-// the last output's thread reads the value in the word the padding completes.
+// The bf16 variant, which is what Gemma's own projections are read through. The
+// weights are narrowed by eacp's host packer and the reference runs on what
+// that leaves, so the disagreement under test is the shader's widening and not
+// the format's precision. An odd element count again, for the padding half.
 auto tBFloat16WeightLinearMatchesCpu =
     test("Kernels/bfloat16WeightLinearMatchesCpu") = []
 {
@@ -364,10 +313,13 @@ auto tBFloat16WeightLinearMatchesCpu =
 
     auto input = spreadValues(rows * inner, 424242u, 2.f);
     auto bias = spreadValues(outputs, 242424u, 1.f);
-    auto weight = widenedBFloat16s(outputs * inner);
+    auto values = spreadValues(outputs * inner, 909090u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
 
     auto inputBuffer = storageOf(input);
-    auto weightBuffer = packedBFloat16Buffer(outputs * inner);
+    auto weightBuffer = storageOf(packed);
     auto biasBuffer = storageOf(bias);
     auto output = outputFor(rows * outputs);
 
@@ -380,14 +332,56 @@ auto tBFloat16WeightLinearMatchesCpu =
     kernel.outputWidth = (unsigned) outputs;
 
     auto result = runOverGrid(kernel, output, outputs, rows);
-    auto expected = linearReference(input, weight, bias, rows, inner, outputs);
-    auto widenedResult = runLinear(input, weight, bias, rows, inner, outputs);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
 
     for (auto i = 0; i < result.size(); ++i)
-    {
         check(isClose(result[i], expected[i], 1e-5));
-        check(result[i] == widenedResult[i]);
-    }
+};
+
+// The quantized form of the same product. The weights go through the very
+// quantizer the loader calls and the reference reads them back through its
+// dequantizer, so what is under test is the shader's byte read and its
+// per-block scale rather than the format's accuracy — and the tolerance is the
+// exact path's, because against the dequantized weights this arithmetic is
+// exact too.
+//
+// An inner extent of 32 is one whole block to a row, which is what the format
+// asks of a weight's contiguous dimension, and six outputs make the table a
+// whole number of scale words.
+auto tInt8WeightLinearMatchesCpu = test("Kernels/int8WeightLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 32;
+    constexpr auto outputs = 6;
+    constexpr auto rows = 5;
+
+    auto input = spreadValues(rows * inner, 424242u, 2.f);
+    auto bias = spreadValues(outputs, 242424u, 1.f);
+    auto values = spreadValues(outputs * inner, 919191u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = Int8WeightLinear {};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+
+    auto result = runOverGrid(kernel, output, outputs, rows);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
 };
 
 namespace
@@ -494,23 +488,33 @@ void checkSplitLinearMatchesCpu(int splitCount,
 }
 } // namespace
 
-// The split form at the four split counts that pick out its two folds: below
-// the group width, where a group holds several outputs and folds them through
-// a shared array, and at and above it, where a group holds one and folds it
-// with groupSum.
+// The split form at the split counts that pick out its two folds: below the
+// group width, where a group holds several outputs and folds them through a
+// shared array, and at and above it, where a group holds one and folds it with
+// groupSum — with 32 for the simdSum fold, and the decoder's own two, 128 in a
+// projection and 32 in the logits.
 //
-// The model's own row width is in here — 2048 in and 2048 out, one row, which
-// is a decode step's projection — with a modest column count rather than the
-// logits' 256,000, since what a wide output tests is the dispatch height and
-// that is the same arithmetic at 384 as at a quarter of a million.
+// **And at every record width the loop picks between.** A lane's run is
+// sixteen weights, eight, four or one, the widest of them the row divides by,
+// so the four inner extents here are 16, 24, 12 and 7 — one for each branch —
+// beside the model's own 2048, which takes the sixteen-wide one.
+//
+// The model's row width is in here at the shape a decode step has it — 2048 in,
+// one row — with a modest column count rather than the logits' 256,000, since
+// what a wide output tests is the dispatch height and that is the same
+// arithmetic at 384 as at a quarter of a million.
 auto tSplitLinearMatchesCpu = test("Kernels/splitLinearMatchesCpu") = []
 {
     if (!Device::shared().isValid())
         return;
 
-    for (const auto splits: {8, 32, 64, 96})
+    for (const auto splits: {8, 32, 64, 96, 128})
     {
         checkSplitLinearMatchesCpu(splits, rowCount, innerCount, outputWidth);
+
+        for (const auto inner: {16, 24, 12, 7})
+            checkSplitLinearMatchesCpu(splits, 3, inner, 5);
+
         checkSplitLinearMatchesCpu(splits, 1, 2048, 384);
         checkSplitLinearMatchesCpu(splits, 2, 2048, 256);
     }
@@ -534,19 +538,10 @@ auto tSplitLinearFoldsGeluAndResidual =
     }
 };
 
-// The packed-half split form, which is what a logits projection over a packed
-// embedding would run, over the same widened halves the dense one is checked
-// against.
-auto tHalfWeightSplitLinearMatchesCpu =
-    test("Kernels/halfWeightSplitLinearMatchesCpu") = []
+namespace
 {
-    if (!Device::shared().isValid())
-        return;
-
-    constexpr auto inner = 8;
-    constexpr auto outputs = 5;
-    constexpr auto rows = 2;
-
+void checkHalfSplitLinear(int splitCount, int rows, int inner, int outputs)
+{
     auto input = spreadValues(rows * inner, 424242u, 2.f);
     auto bias = spreadValues(outputs, 242424u, 1.f);
     auto weight = widenedHalves(outputs * inner);
@@ -556,7 +551,7 @@ auto tHalfWeightSplitLinearMatchesCpu =
     auto biasBuffer = storageOf(bias);
     auto output = outputFor(rows * outputs);
 
-    auto kernel = HalfWeightSplitLinear {32};
+    auto kernel = HalfWeightSplitLinear {splitCount};
     kernel.input = inputBuffer;
     kernel.weights = weightBuffer;
     kernel.bias = biasBuffer;
@@ -572,69 +567,149 @@ auto tHalfWeightSplitLinearMatchesCpu =
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
+}
+} // namespace
+
+// The packed-half split form, which is what a logits projection over a packed
+// embedding would run, over the same widened halves the dense one is checked
+// against — and over the same four inner extents, one for each record width the
+// loop picks between.
+auto tHalfWeightSplitLinearMatchesCpu =
+    test("Kernels/halfWeightSplitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto inner: {16, 24, 12, 8, 7})
+        checkHalfSplitLinear(32, 2, inner, 5);
 };
 
 namespace
 {
-// The bf16 split form against both of its answers: the scalar reference over
-// the widened weights, and the float program over those same widened weights
-// bit for bit.
-void checkBFloat16SplitLinear(int inner, int outputs, int rows)
+void checkBFloat16SplitLinear(int splitCount, int rows, int inner, int outputs)
 {
-    auto input = spreadValues(rows * inner, 424242u, 2.f);
-    auto bias = spreadValues(outputs, 242424u, 1.f);
-    auto weight = widenedBFloat16s(outputs * inner);
+    auto input = spreadValues(rows * inner, 515151u, 2.f);
+    auto bias = spreadValues(outputs, 626262u, 1.f);
+    auto values = spreadValues(outputs * inner, 737373u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::packedBFloat16s(values, widened);
 
     auto inputBuffer = storageOf(input);
-    auto packedWeights = packedBFloat16Buffer(outputs * inner);
-    auto widenedWeights = storageOf(weight);
+    auto weightBuffer = storageOf(packed);
     auto biasBuffer = storageOf(bias);
-    auto packedOutput = outputFor(rows * outputs);
-    auto widenedOutput = outputFor(rows * outputs);
+    auto output = outputFor(rows * outputs);
 
-    auto bind = [&](auto& kernel, const Buffer& weights, const Buffer& target)
-    {
-        kernel.input = inputBuffer;
-        kernel.weights = weights;
-        kernel.bias = biasBuffer;
-        kernel.output = target;
-        kernel.innerCount = (unsigned) inner;
-        kernel.outputWidth = (unsigned) outputs;
-        kernel.rowCount = (unsigned) rows;
-        kernel.gelu = 0u;
-        kernel.residual = 0u;
-    };
+    auto kernel = BFloat16WeightSplitLinear {splitCount};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+    kernel.rowCount = (unsigned) rows;
+    kernel.gelu = 0u;
+    kernel.residual = 0u;
 
-    auto packedKernel = BFloat16WeightSplitLinear {32};
-    bind(packedKernel, packedWeights, packedOutput);
+    auto result = runSplitLinear(kernel, output, outputs, rows);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
 
-    auto widenedKernel = SplitLinear {32};
-    bind(widenedKernel, widenedWeights, widenedOutput);
-
-    auto result = runSplitLinear(packedKernel, packedOutput, outputs, rows);
-    auto widened = runSplitLinear(widenedKernel, widenedOutput, outputs, rows);
-    auto expected = linearReference(input, weight, bias, rows, inner, outputs);
+    const auto tolerance = TiledProduct::dotProductTolerance(inner);
 
     for (auto i = 0; i < result.size(); ++i)
-    {
-        check(isClose(result[i], expected[i], 1e-5));
-        check(result[i] == widened[i]);
-    }
+        check(isClose(result[i], expected[i], tolerance));
 }
 } // namespace
 
-// The form a decode step's projections and its logits product actually take,
-// in Gemma's own storage. Both weight reads are covered: an inner count that
-// divides by four takes the two-word readBFloat16x2 path, and one that does
-// not takes the element read — and the second leaves an odd element count, so
-// the last output's thread reads the value in the word the padding completes.
+// The bf16 split form, which is the product a decode step spends nearly all its
+// bandwidth in — every projection and the logits row against the tied
+// embedding. All four of the kernel's inner loops are covered, which for bf16
+// is one, two or four `readBFloat16x4` of two words each and then the
+// element-at-a-time read: 16 takes the sixteen-wide record, 24 the eight-wide,
+// 12 the four-wide and 7 and 11 the single elements.
+//
+// The model's own decode shape is in here too — one row, 2048 in — since that
+// is the only place the wide bf16 read is on the hot path.
 auto tBFloat16WeightSplitLinearMatchesCpu =
     test("Kernels/bfloat16WeightSplitLinearMatchesCpu") = []
 {
     if (!Device::shared().isValid())
         return;
 
-    checkBFloat16SplitLinear(8, 5, 2);
-    checkBFloat16SplitLinear(7, 5, 2);
-    checkBFloat16SplitLinear(64, 3, 1);
+    for (const auto splits: {8, 32, 64, 96, 128})
+    {
+        for (const auto inner: {16, 24, 12, 8, 11})
+            checkBFloat16SplitLinear(splits, 2, inner, 5);
+
+        checkBFloat16SplitLinear(splits, 5, 7, 3);
+        checkBFloat16SplitLinear(splits, 1, 2048, 384);
+    }
+};
+
+namespace
+{
+void checkInt8SplitLinear(int splitCount, int rows, int inner, int outputs)
+{
+    auto input = spreadValues(rows * inner, 515151u, 2.f);
+    auto bias = spreadValues(outputs, 626262u, 1.f);
+    auto values = spreadValues(outputs * inner, 747474u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = Int8WeightSplitLinear {splitCount};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+    kernel.rowCount = (unsigned) rows;
+    kernel.gelu = 0u;
+    kernel.residual = 0u;
+
+    auto result = runSplitLinear(kernel, output, outputs, rows);
+    auto expected = linearReference(input, widened, bias, rows, inner, outputs);
+
+    const auto tolerance = TiledProduct::dotProductTolerance(inner);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], tolerance));
+}
+} // namespace
+
+// The quantized split form, which is the product a decode step spends nearly
+// all its bandwidth in once the weights are quantized — every projection and
+// the logits row against the tied embedding.
+//
+// **Only the sixteen-wide branch is reachable here**, and deliberately: the
+// block format asks that a weight's contiguous dimension be a whole number of
+// thirty-twos, so an inner extent it accepts always divides by sixteen and the
+// three narrower loops beside it can never be the one a quantized weight takes.
+// The model's own decode shape is in the list for the reason the bf16 case has
+// it — one row, 2048 in, which is where the sixteen-wide read is on the hot
+// path.
+//
+// Every split count is covered because each leaves a lane a different run: at
+// 128 lanes over 2048 a lane reads exactly one record of sixteen, which is the
+// decoder's own shape and the one the count was chosen for; at 256 it reads one
+// and half the lanes read none; at 8 it walks sixteen records and fetches
+// sixteen scales, one block apart each time.
+auto tInt8WeightSplitLinearMatchesCpu =
+    test("Kernels/int8WeightSplitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto splits: {8, 32, 64, 96, 128, 256})
+    {
+        checkInt8SplitLinear(splits, 2, 32, 6);
+        checkInt8SplitLinear(splits, 5, 64, 3);
+        checkInt8SplitLinear(splits, 1, 2048, 384);
+    }
 };

@@ -30,10 +30,10 @@ namespace HF
 // are opposite. A prompt step normalises many rows at once and fills the
 // machine on its own, where a wider group only adds barriers; a decode step is
 // one row of 2048 with nothing else running, where the widest group that still
-// has work for every lane is what hides the latency. LayerNorm in WhisperEACP
-// measured to opposite answers at the same two shapes, which is why the count
-// is a parameter rather than a constant; what the decoder's own shapes measure
-// to is in Decoder.h beside normLanes.
+// has work for every lane is what hides the latency. Neither default here is
+// measured on Gemma's shapes yet — LayerNorm in WhisperEACP measured to
+// opposite answers at the same two shapes, which is why the count is a
+// parameter rather than a constant.
 struct RMSNorm final : ReducingProgram
 {
     // config.json's rms_norm_eps. Inside the square root, as Hugging Face
@@ -65,7 +65,7 @@ struct RMSNorm final : ReducingProgram
                  summing += lanes;
              });
 
-        auto scale = var(rsqrt(groupSum(squares.get()) / width + epsilon));
+        auto scale = var(rsqrt(foldSum(squares.get()) / width + epsilon));
         auto writing = var(lane);
 
         loop(writing.get() < rowLength,

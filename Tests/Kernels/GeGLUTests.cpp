@@ -228,3 +228,42 @@ auto tGeGluOneProgramTwoWidths = test("Kernels/geGluOneProgramTwoWidths") = []
             check(isClose(result[i], expected[i], tolerance));
     }
 };
+
+// The gate's tails through the kernel Gemma's feed-forward actually dispatches.
+// GeluTests has the same check on the standalone activation; this one is here
+// because it is this kernel the model runs, and because the gate of a real
+// layer does reach thirty — which asks tanh for an argument of about 990, where
+// Metal's own returns a NaN under the compile options eacp builds a library
+// with. saturatingTanh is what answers it, and one NaN in the residual stream
+// is the whole rest of the sequence.
+//
+// The up operand is deliberately not one: a gate tail multiplied by zero would
+// hide a NaN rather than propagate it.
+auto tGeGluGateTailsStayFinite = test("Kernels/geGluGateTailsStayFinite") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const float tails[] = {-1000.f, -100.f, -30.f, -10.f, 0.f, 10.f, 30.f, 1000.f};
+    constexpr auto tailCount = (int) (sizeof(tails) / sizeof(tails[0]));
+
+    auto gate = sized(tailCount);
+    auto up = sized(tailCount);
+
+    for (auto i = 0; i < tailCount; ++i)
+    {
+        gate[i] = tails[i];
+        up[i] = 1.f + 0.5f * (float) i;
+    }
+
+    auto result = runGeGLU(gate, up, 1, tailCount);
+    auto splitResult = runSplitGeGLU(gate, up, 1, tailCount);
+    auto expected = geGluReference(gate, up, 1, tailCount);
+
+    for (auto i = 0; i < tailCount; ++i)
+    {
+        check(std::isfinite(result[i]));
+        check(result[i] == splitResult[i]);
+        check(isClose(result[i], expected[i], tolerance));
+    }
+};

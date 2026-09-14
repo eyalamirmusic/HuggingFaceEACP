@@ -62,21 +62,21 @@ float halfToFloat(std::uint16_t bits)
 
 // bfloat16 is the top half of a float32, so widening is a shift and nothing
 // else: exact for every pattern, subnormals, zeros, infinities and NaNs alike,
-// and identical to what plan.md's readBFloat16 would do in a shader.
+// and identical bit for bit to what eacp's readBFloat16 does in a shader, which
+// is what lets a reference on the CPU check the packed path's arithmetic.
 float bfloatToFloat(std::uint16_t bits)
 {
     return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
 }
 
 template <typename Element, typename Widen>
-void widenEach(Span<const std::uint8_t> source, Span<float> destination, Widen widen)
+void widenEach(const std::uint8_t* source, Span<float> destination, Widen widen)
 {
     for (auto index = 0; index < destination.size(); ++index)
     {
         auto element = Element {};
         std::memcpy(&element,
-                    source.data()
-                        + static_cast<std::size_t>(index) * sizeof(Element),
+                    source + static_cast<std::size_t>(index) * sizeof(Element),
                     sizeof(Element));
 
         destination[index] = widen(element);
@@ -87,34 +87,7 @@ void widenToFloat(const TensorInfo& tensor,
                   Span<const std::uint8_t> source,
                   Span<float> destination)
 {
-    switch (tensor.type)
-    {
-        case TensorType::F32:
-            std::memcpy(destination.data(),
-                        source.data(),
-                        static_cast<std::size_t>(source.size()));
-            return;
-
-        case TensorType::F16:
-            widenEach<std::uint16_t>(source, destination, halfToFloat);
-            return;
-
-        case TensorType::BF16:
-            widenEach<std::uint16_t>(source, destination, bfloatToFloat);
-            return;
-
-        case TensorType::F64:
-            widenEach<double>(source,
-                              destination,
-                              [](double value)
-                              { return static_cast<float>(value); });
-            return;
-
-        default:
-            throw ModelError {"tensor '" + tensor.name + "' has type "
-                              + std::string {tensorTypeName(tensor.type)}
-                              + ", which is not a float type"};
-    }
+    widenTensorElements(tensor, source, 0, destination);
 }
 
 Vector<std::int64_t> parseShape(const Miro::Json::Object& entry,
@@ -227,11 +200,11 @@ eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
         raw.data(), raw.size(), eacp::GPU::BufferUsage::Storage);
 }
 
-// A buffer of 16-bit floats is read one 32-bit word at a time — readHalf(i)
-// and readBFloat16(i) both fetch word i / 2 and pick a side of it — so an odd
-// count of them needs a padding element rather than a read one element past
-// the allocation. An even count, which is every weight matrix of an even
-// width, still goes up untouched.
+// A buffer of sixteen-bit floats is read one 32-bit word at a time —
+// readHalf(i) and readBFloat16(i) fetch word i / 2 and pick a side of it — so
+// an odd element count needs a padding element rather than a read one past the
+// allocation. An even count, which is every weight matrix of an even width,
+// still goes up untouched.
 eacp::GPU::Buffer uploadPackedPairs(Span<const std::uint8_t> raw)
 {
     constexpr auto wordBytes = 4;
@@ -265,6 +238,46 @@ std::map<std::string, std::string> parseMetadata(const Miro::Json::Value& value)
     return metadata;
 }
 } // namespace
+
+void widenTensorElements(const TensorInfo& tensor,
+                         Span<const std::uint8_t> bytes,
+                         std::int64_t first,
+                         Span<float> destination)
+{
+    const auto* source =
+        bytes.data()
+        + static_cast<std::size_t>(first * bytesPerElement(tensor.type));
+
+    switch (tensor.type)
+    {
+        case TensorType::F32:
+            std::memcpy(destination.data(),
+                        source,
+                        sizeof(float)
+                            * static_cast<std::size_t>(destination.size()));
+            return;
+
+        case TensorType::F16:
+            widenEach<std::uint16_t>(source, destination, halfToFloat);
+            return;
+
+        case TensorType::BF16:
+            widenEach<std::uint16_t>(source, destination, bfloatToFloat);
+            return;
+
+        case TensorType::F64:
+            widenEach<double>(source,
+                              destination,
+                              [](double value)
+                              { return static_cast<float>(value); });
+            return;
+
+        default:
+            throw ModelError {"tensor '" + tensor.name + "' has type "
+                              + std::string {tensorTypeName(tensor.type)}
+                              + ", which is not a float type"};
+    }
+}
 
 std::int64_t TensorInfo::elementCount() const
 {
@@ -472,26 +485,36 @@ TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
     // Already a layout a kernel binds, so these go straight from the blob
     // rather than through a widened copy of themselves: F32 as the floats a
     // subscript reads, F16 and BF16 as the packed pairs readHalf and
-    // readBFloat16 read. A safetensors blob stores either as two little-endian
-    // 16-bit values per 32-bit word, which is the layout those calls index, so
-    // the bytes reach the device untouched.
+    // readBFloat16 read. Gemma's own weights are BF16, so this is what halves
+    // what the device holds against the widened path this used to take.
     if (tensor.type == TensorType::F32)
         return {uploadBytes(rawBytes(tensor)), tensor.type};
 
-    if (tensor.type == TensorType::F16 || tensor.type == TensorType::BF16)
+    if (isPackedSixteenBit(tensor.type))
         return {uploadPackedPairs(rawBytes(tensor)), tensor.type};
 
-    return makeWidenedBuffer(name);
+    // F64 and the integer types have no shader read of their own, so the
+    // conversion has to happen somewhere and doing it once here beats doing it
+    // in every kernel.
+    return widenedBuffer(tensor);
 }
 
-// F64 through makeBuffer, and anything a float-only program is bound to. The
-// widening is exact for both 16-bit floats, so a tensor read here and the same
-// tensor read packed in a shader are the same numbers rather than the same
-// numbers to a tolerance.
-TensorBuffer SafeTensors::makeWidenedBuffer(std::string_view name) const
+TensorBuffer SafeTensors::makeFloatBuffer(std::string_view name) const
 {
     const auto& tensor = info(name);
-    const auto values = readFloats(name);
+
+    if (tensor.type == TensorType::F32)
+        return {uploadBytes(rawBytes(tensor)), TensorType::F32};
+
+    return widenedBuffer(tensor);
+}
+
+TensorBuffer SafeTensors::widenedBuffer(const TensorInfo& tensor) const
+{
+    auto values = Vector<float> {};
+    values.resize(static_cast<int>(tensor.elementCount()));
+    widenToFloat(tensor, rawBytes(tensor), values);
+
     const auto byteCount = static_cast<std::int64_t>(values.size())
                            * static_cast<std::int64_t>(sizeof(float));
 

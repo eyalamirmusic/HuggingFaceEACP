@@ -166,6 +166,12 @@ struct SimdTiledMatMulProgram final : ComputeProgram
             {
                 if constexpr (bLayout == OperandLayout::ContiguousK)
                 {
+                    const auto slotOf = [&](unsigned i)
+                    {
+                        return columnSlabBase + (loadDepth + i) * tileWidth
+                               + loadRow;
+                    };
+
                     for (auto i = 0u; i < 8u; ++i)
                     {
                         auto k = k0.get() + loadDepth + i;
@@ -179,10 +185,33 @@ struct SimdTiledMatMulProgram final : ComputeProgram
                                foldMaximum,
                                foldSum);
 
-                        write(staging,
-                              columnSlabBase + (loadDepth + i) * tileWidth + loadRow,
-                              select(inside, weight(bRow + at), 0.f));
+                        // **The unquantized storages stage their weight here,
+                        // beside the A element that shares the loop**, and it
+                        // matters: lifting it out into a pass of its own, which
+                        // is what the quantized run below has to be, costs the
+                        // packed path 6% of a 994-row prefill for arithmetic
+                        // that did not change. The interleaving is what the
+                        // scheduler wants and it is cheap to keep.
+                        if constexpr (bStorage != WeightStorage::Int8Blocks)
+                            write(staging,
+                                  slotOf(i),
+                                  select(inside, weight(bRow + at), 0.f));
                     }
+
+                    if constexpr (bStorage == WeightStorage::Int8Blocks)
+                        stageWeightRun(
+                            bRow + k0.get() + loadDepth,
+                            k0.get() + loadDepth + 8u <= innerCount,
+                            [&](unsigned i, const Float& value)
+                            { write(staging, slotOf(i), value); },
+                            [&](unsigned i)
+                            {
+                                auto k = k0.get() + loadDepth + i;
+
+                                return select(k < innerCount,
+                                              weight(bRow + min(k, innerCount - 1u)),
+                                              0.f);
+                            });
                 }
                 else
                 {
@@ -374,12 +403,52 @@ struct SimdTiledMatMulProgram final : ComputeProgram
 
     Float weight(const UInt& index)
     {
-        if constexpr (bStorage == WeightStorage::PackedHalf)
-            return b.readHalf(index);
-        else if constexpr (bStorage == WeightStorage::PackedBFloat16)
-            return b.readBFloat16(index);
-        else
-            return b[index];
+        return storedWeight<bStorage>(b, index, scaleBase());
+    }
+
+    // TiledMatMulProgram's, at this kernel's own uniforms: past B's columnCount
+    // rows of bStride, in halves, and read by the quantized storage alone.
+    UInt scaleBase() { return columnCount * bStride / 2u; }
+
+    // TiledMatMulProgram's too, and its comment is where the reasoning is: a
+    // quantized run of eight is one eight-byte load and one scale read where
+    // the loop beside it is eight of each.
+    template <typename Place, typename Narrow>
+    void stageWeightRun(const UInt& first,
+                        const Bool& whole,
+                        Place&& place,
+                        Narrow&& narrow)
+    {
+        const auto oneAtATime = [&]
+        {
+            for (auto i = 0u; i < 8u; ++i)
+                place(i, narrow(i));
+        };
+
+        if constexpr (bStorage != WeightStorage::Int8Blocks)
+        {
+            oneAtATime();
+            return;
+        }
+
+        ifThen(
+            whole && first % 8u == 0u,
+            [&]
+            {
+                auto run = storedWeight8<bStorage>(b, first, scaleBase());
+                const Float values[8] = {run.low.x(),
+                                         run.low.y(),
+                                         run.low.z(),
+                                         run.low.w(),
+                                         run.high.x(),
+                                         run.high.y(),
+                                         run.high.z(),
+                                         run.high.w()};
+
+                for (auto i = 0u; i < 8u; ++i)
+                    place(i, values[i]);
+            },
+            oneAtATime);
     }
 
     // TiledMatMulProgram's reason for writing this out rather than declaring
@@ -451,6 +520,8 @@ using HalfWeightSimdTiledLinear =
 using BFloat16WeightSimdTiledLinear =
     SimdTiledMatMulProgram<OperandLayout::ContiguousK,
                            WeightStorage::PackedBFloat16>;
+using Int8WeightSimdTiledLinear =
+    SimdTiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Int8Blocks>;
 using SimdTiledMatMul =
     SimdTiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
 using SoftmaxSimdTiledMatMul = SimdTiledMatMulProgram<OperandLayout::ContiguousN,
@@ -471,18 +542,25 @@ using MaximaSimdTiledLinear = SimdTiledMatMulProgram<OperandLayout::ContiguousK,
 // is what every other backend gets, and what a role goes back to if it ever
 // measures no better on it.
 #if defined(__APPLE__)
-using LinearProduct = SimdTiledLinear;
-using HalfWeightLinearProduct = HalfWeightSimdTiledLinear;
-using BFloat16WeightLinearProduct = BFloat16WeightSimdTiledLinear;
+template <WeightStorage storage>
+using LinearProductFor = SimdTiledMatMulProgram<OperandLayout::ContiguousK, storage>;
+
 using AttentionScoresProduct = MaximaSimdTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxSimdTiledMatMul;
 #else
-using LinearProduct = TiledLinear;
-using HalfWeightLinearProduct = HalfWeightTiledLinear;
-using BFloat16WeightLinearProduct = BFloat16WeightTiledLinear;
+template <WeightStorage storage>
+using LinearProductFor = TiledMatMulProgram<OperandLayout::ContiguousK, storage>;
+
 using AttentionScoresProduct = MaximaTiledLinear;
 using SoftmaxAttentionApplyProduct = SoftmaxTiledMatMul;
 #endif
+
+// The four storages a checkpoint's projection weights may arrive in, each
+// through whichever of the two programs above this backend took.
+using LinearProduct = LinearProductFor<WeightStorage::Float>;
+using HalfWeightLinearProduct = LinearProductFor<WeightStorage::PackedHalf>;
+using BFloat16WeightLinearProduct = LinearProductFor<WeightStorage::PackedBFloat16>;
+using Int8WeightLinearProduct = LinearProductFor<WeightStorage::Int8Blocks>;
 
 // The scores product reports its maxima in its own tiling and the apply folds
 // them in the apply's, so the two roles have to be tiled the same way. They

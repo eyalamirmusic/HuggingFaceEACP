@@ -44,11 +44,11 @@ auto tCheckpointFilesAreThere = test("Model/Checkpoint/filesAreThere") = []
     check(files.shards.size() >= 1);
 };
 
-// gemma-2b.gguf, the 10 GB F32 conversion the same repo ships beside the
-// safetensors and the file Tests/Oracle runs llama.cpp over. Recorded and not
-// required, the way the tokenizer files are: a checkpoint downloaded for the
-// kernels alone has no reason to carry it, so this says which of the two a
-// directory is rather than failing on the smaller one.
+// gemma-2b.gguf, the 10 GB F32 conversion of the safetensors beside it and the
+// file Tests/Oracle runs llama.cpp over. Recorded and not required, the way the
+// tokenizer files are: a checkpoint fetched for the kernels alone has no reason
+// to carry it, so this says which of the two a directory is rather than failing
+// on the smaller one.
 auto tCheckpointGgufIsRecorded = test("Model/Checkpoint/ggufIsRecorded") = []
 {
     if (!hasRealCheckpoint())

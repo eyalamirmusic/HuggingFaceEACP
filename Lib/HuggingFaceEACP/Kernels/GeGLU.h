@@ -24,6 +24,25 @@ namespace HF
 // rowCount). Out of place in both forms — the output is [rows, intermediate]
 // and the concatenated input is [rows, 2 * intermediate], so writing into the
 // input's first half would land on a row another thread has not read yet.
+//
+// **This stays a dispatch of its own, and that was measured.** Folding it into
+// a neighbouring product would save a decode step 18 layers of one 128 KB read
+// and one 64 KB write — 3.5 MB against the 5.0 GB of weights the same step
+// reads, which is 0.07% of its traffic. Removing the stage outright, which is
+// the ceiling any fusion could reach, measures 95.4 tokens/s against 95.1 over
+// 16 decode tokens and 86.0 against 85.5 over 64: a third of a percent and
+// half a percent, at the edge of the run-to-run noise. Neither fold is worth
+// the kernel it would cost, and the two are not equally priced either. Folding
+// into the down product's operand read is the cheap one to write and the
+// expensive one to run, since that product's 2048 outputs each walk the whole
+// 16384-wide row — it would evaluate the activation 2048 times per element
+// instead of once. Folding into the gate-and-up product's store is the one
+// that is actually free at run time, and it needs a product kernel that
+// computes two dot products per output and folds them, in both the split and
+// the tiled form and in each of the three weight storages. A step at memory
+// bandwidth has no arithmetic or dispatch cost left to save — the same
+// conclusion the attention lane-count experiment reached from the other
+// direction.
 
 // The concatenated form: gate is columns [0, intermediate) of a row and up is
 // columns [intermediate, 2 * intermediate), so the input's row stride is twice

@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "TiledProduct.h"
 
 using namespace nano;
 using namespace HF;
@@ -75,6 +76,96 @@ auto tMatMulMatchesCpu = test("Kernels/matMulMatchesCpu") = []
 
     auto result = runMatMul(a, b, bias, rowCount, innerCount, columnCount);
     auto expected = matMulReference(a, b, bias, rowCount, innerCount, columnCount);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
+};
+
+// The two packed variants of the same product, over weights narrowed by the
+// host packer so the reference sees exactly what the shader widens back. An odd
+// element count in both, so the last element's thread reads the half of a word
+// the padding completes.
+auto tPackedWeightMatMulMatchesCpu =
+    test("Kernels/packedWeightMatMulMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    auto a = spreadValues(rowCount * innerCount, 313131u, 2.f);
+    auto bias = spreadValues(columnCount, 484848u, 1.f);
+    auto values = spreadValues(innerCount * columnCount, 595959u, 3.f);
+
+    auto checkPacked = [&](auto& kernel, TiledProduct::WeightPacker pack)
+    {
+        auto widened = Vector<float> {};
+        auto packed = pack(values, widened);
+
+        auto aBuffer = storageOf(a);
+        auto bBuffer = storageOf(packed);
+        auto biasBuffer = storageOf(bias);
+        auto output = outputFor(rowCount * columnCount);
+
+        kernel.a = aBuffer;
+        kernel.b = bBuffer;
+        kernel.bias = biasBuffer;
+        kernel.output = output;
+        kernel.innerCount = (unsigned) innerCount;
+        kernel.columnCount = (unsigned) columnCount;
+
+        auto result = runOverGrid(kernel, output, columnCount, rowCount);
+        auto expected =
+            matMulReference(a, widened, bias, rowCount, innerCount, columnCount);
+
+        for (auto i = 0; i < result.size(); ++i)
+            check(isClose(result[i], expected[i], 1e-5));
+    };
+
+    auto half = HalfWeightMatMul {};
+    auto bfloat = BFloat16WeightMatMul {};
+
+    checkPacked(half, TiledProduct::packedHalves);
+    checkPacked(bfloat, TiledProduct::packedBFloat16s);
+};
+
+// The quantized weight through the same product, at a shape the block format
+// takes: B is [innerCount, columnCount] here, so the contiguous dimension the
+// blocks run along is the column count rather than the inner extent — which is
+// the whole of what the format asks, since a block is thirty-two stored
+// elements and the kernel finds one by dividing an index.
+//
+// The reference runs on the dequantized weights, so what this checks is the
+// shader's byte read and its scale, not the format's accuracy.
+auto tInt8WeightMatMulMatchesCpu = test("Kernels/int8WeightMatMulMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 5;
+    constexpr auto columns = 64;
+    constexpr auto rows = 3;
+
+    auto a = spreadValues(rows * inner, 606060u, 2.f);
+    auto bias = spreadValues(columns, 707070u, 1.f);
+    auto values = spreadValues(inner * columns, 808080u, 3.f);
+
+    auto widened = Vector<float> {};
+    auto packed = TiledProduct::quantizedInt8Blocks(values, widened);
+
+    auto aBuffer = storageOf(a);
+    auto bBuffer = storageOf(packed);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * columns);
+
+    auto kernel = Int8WeightMatMul {};
+    kernel.a = aBuffer;
+    kernel.b = bBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.columnCount = (unsigned) columns;
+
+    auto result = runOverGrid(kernel, output, columns, rows);
+    auto expected = matMulReference(a, widened, bias, rows, inner, columns);
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
@@ -200,48 +291,4 @@ auto tMatMulOneProgramTwoShapes = test("Kernels/matMulOneProgramTwoShapes") = []
 
     for (auto i = 0; i < secondResult.size(); ++i)
         check(isClose(secondResult[i], secondExpected[i], 1e-5));
-};
-
-// The same product over a weight left in the storage Gemma ships, checked
-// twice: against the reference over the widened weights, and against the float
-// program over those same weights bit for bit. Widening a bf16 is the sixteen
-// bits back at the top of a word, so both programs multiply and add identical
-// float32 numbers in identical order and "the same answer" is exact.
-auto tBFloat16WeightMatMulMatchesCpu =
-    test("Kernels/bfloat16WeightMatMulMatchesCpu") = []
-{
-    if (!Device::shared().isValid())
-        return;
-
-    auto a = spreadValues(rowCount * innerCount, 314159u, 2.f);
-    auto b = spreadValues(innerCount * columnCount, 271828u, 3.f);
-    auto bias = spreadValues(columnCount, 161803u, 1.f);
-
-    auto widened = Vector<float> {};
-    auto packed = packedBFloat16Storage(b, widened);
-
-    auto aBuffer = storageOf(a);
-    auto biasBuffer = storageOf(bias);
-    auto output = outputFor(rowCount * columnCount);
-
-    auto kernel = BFloat16WeightMatMul {};
-    kernel.a = aBuffer;
-    kernel.b = packed;
-    kernel.bias = biasBuffer;
-    kernel.output = output;
-    kernel.innerCount = (unsigned) innerCount;
-    kernel.columnCount = (unsigned) columnCount;
-
-    auto result = runOverGrid(kernel, output, columnCount, rowCount);
-    auto expected =
-        matMulReference(a, widened, bias, rowCount, innerCount, columnCount);
-
-    auto widenedResult =
-        runMatMul(a, widened, bias, rowCount, innerCount, columnCount);
-
-    for (auto i = 0; i < result.size(); ++i)
-    {
-        check(isClose(result[i], expected[i], 1e-5));
-        check(result[i] == widenedResult[i]);
-    }
 };

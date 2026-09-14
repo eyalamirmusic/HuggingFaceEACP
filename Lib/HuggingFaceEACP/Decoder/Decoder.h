@@ -31,9 +31,10 @@ namespace HF
 // it is given and writes their logits, so the prompt a run opens with is one
 // call and each token after it is another.
 //
-// prepare() compiles every kernel, sizes every intermediate and every cache,
-// and uploads the rotary tables and the zero biases; the recording calls only
-// record. A step is one pass rather than one pass per dispatch: at a few
+// prepare() compiles every kernel a checkpoint's weights will be dispatched
+// through, sizes every intermediate and every cache, and uploads the rotary
+// tables and the zero biases; the recording calls only record. A step is one
+// pass rather than one pass per dispatch: at a few
 // microseconds of GPU each, ninety passes would be most of a step, and the KV
 // cache is read in the same pass that appended to it.
 //
@@ -48,13 +49,19 @@ namespace HF
 // One program of each kind serves every layer: the shapes are uniforms, so
 // eighteen layers of two norms, four projections and an attention are
 // re-bindings of a handful of pipelines rather than pipelines of their own. The
-// products are the exception, and are held nine ways over three questions: what
-// the weight's buffer holds — floats, packed halves or packed bfloat16s, since
-// a program can only read the one it was compiled for; the many-row tiled form
-// a prompt takes against the few-row split form a decode step takes; and,
-// inside that split form, the split count the shape wants — see stepSplitCount
-// and logitsSplitCount below. The embedding gather is held three ways for the
-// first of those questions alone.
+// products are the exception, and are declared twelve ways over three
+// questions: the weight's storage, since a checkpoint may ship F32, fp16 or
+// bf16 and the loader may have quantized it to int8 blocks, and nothing about a
+// GPU buffer says which; the many-row tiled form a prompt takes against the
+// few-row split form a decode step takes; and, inside that split form, the
+// split count the shape wants — see stepSplitCount and logitsSplitCount below.
+// The embedding gather is declared four ways for the first of those reasons
+// alone.
+//
+// **Only one storage's worth is built.** A checkpoint is in one storage, so
+// prepare() takes the weights and compiles the four programs they name; the
+// other twelve stay empty optionals. Compiling all sixteen built three whole
+// SIMD-group matrix pipelines that nothing would ever dispatch.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -64,8 +71,22 @@ class Decoder
 public:
     explicit Decoder(const DecoderShape& shapeToUse);
 
-    void prepare(eacp::GPU::Device& device);
-    void prepare();
+    // Compiles the kernels, sizes every intermediate and every cache, and
+    // uploads the rotary tables and the zero biases.
+    //
+    // **The weights are an argument because the products are not one program.**
+    // Each of them is held per WeightStorage, and a checkpoint is in one — so
+    // compiling all four would build three whole SIMD-group matrix pipelines
+    // and three gathers a run never dispatches. What is compiled is
+    // weights.storages() and nothing else, and a step against weights in a
+    // storage this was not prepared for is a ModelError thrown before anything
+    // is recorded.
+    //
+    // Only the storages are read here, not the shape: a decoder may be prepared
+    // against one set of weights and stepped against another of the same
+    // storage, and step() is where a shape that disagrees is refused.
+    void prepare(eacp::GPU::Device& device, const DecoderWeights& weights);
+    void prepare(const DecoderWeights& weights);
 
     const DecoderShape& shape() const { return decoderShape; }
 
@@ -130,51 +151,62 @@ private:
     // of rows the extra weight traffic is the whole cost of a bandwidth-bound
     // step — which puts the crossover low. A decode step is one row; three is
     // a speculative triple.
-    //
-    // Measured on gemma-2b on an M5 Max, as what one prefill block of that
-    // many rows costs: one row is 25 ms split against the tiled product's 65,
-    // two 42 against 59, three 59 against 57, and four 77 against 53. The
-    // crossover is between two and three rows, so three is where the two forms
-    // meet and every row past it belongs to the tiled product.
     static constexpr auto splitRowLimit = 3;
 
     // How many lanes share one output's inner sum in a step's projections.
+    // **Measured on Gemma's widths**, which the 64 this started at was not: at
+    // records of four weights a lane, over a 6-token prompt and 64 decode
+    // tokens in Release, 32 and 64 both gave 83.6 tokens/s, 96 gave 84.1, 128
+    // gave 84.6 and 256 gave 85.3, and past that the curve fell off a cliff —
+    // 384 at 77.4, 512 at 61.6, 1024 at 27.3.
     //
-    // Measured on gemma-2b on an M5 Max, 64 tokens from a short prompt, best
-    // of five runs: 16 lanes give 49.9 tokens/s, 32 give 51.9, 64 give 50.8,
-    // 128 give 52.1, 256 and 512 give 53.2, and 1024 halves it to 26.7. The
-    // curve is flat because a decode step reads every weight once at around
-    // 500 GB/s and is bandwidth bound whatever the lane count — which is why
-    // keeping the weights packed as bf16, which halves that traffic, is what
-    // took the rate to about 106 tokens/s, not any number here. Those were
-    // measured over the widened fp32 weights; the shape of the curve is the
-    // same claim over the packed ones. 64 stays: the three to five percent
-    // 256 and 512 add on a 40-core device is not worth a group four times
-    // wider, which a smaller GPU holds fewer of in flight.
-    static constexpr auto stepSplitCount = 64;
+    // **The record went to sixteen weights and the peak moved with it**, which
+    // is the whole reason this is 128 rather than 256. A row of 2048 is 128
+    // records of sixteen, so 128 lanes is exactly one apiece: measured on the
+    // quantized path, 64 lanes give 139.7 decode tokens/s over 64 tokens, 96
+    // give 139.7, 128 give 141.3, 160 give 141.6, 192 give 137.3 and 256 give
+    // 122.8, and the packed path is flat across the same range at 85.4 to 87.0.
+    // 160 and 128 are a tie to within the run-to-run noise; 128 is the one of
+    // them with a reason behind it rather than a peak in it.
+    static constexpr auto stepSplitCount = 128;
 
-    // The logits projection wants fewer. Its 256,000 outputs fill the device at
-    // any split count, so the only thing more lanes buy is a longer fold —
-    // WhisperEACP measured 32 the floor of that curve over a 51,864-wide row,
-    // and Gemma's 256,000-wide one is flatter still: every count from 8 to 256
-    // lands between 50.5 and 51.4 tokens/s, which is inside the run-to-run
-    // spread.
+    // The logits projection wants fewer, and the measurement agrees with the
+    // number WhisperEACP arrived at over a 51,864-wide row. Its 256,000 outputs
+    // fill the device at any split count, so the only thing more lanes buy is a
+    // longer fold: at stepSplitCount 256 the same run gives 85.5 tokens/s at 16
+    // lanes, 85.3 at 32, 85.0 at 64, 84.1 at 128 and 84.4 at 256. The top of
+    // that curve is flat to within the noise, and 32 is the one point on it
+    // where a group is exactly one SIMD group per output — the simdSum fold
+    // Linear.h describes, with neither scratch nor a barrier — so it is kept
+    // for a reason measurement supports rather than supplies. Re-measured at
+    // sixteen-wide records and stepSplitCount 128, and it is flat there too:
+    // 141.3 quantized decode tokens/s over 64 at 16 lanes, 141.3 at 32, 139.7
+    // at 64.
     static constexpr auto logitsSplitCount = 32;
 
     // A decode step's norms are one row of 2048 with nothing else on the
     // machine, so what is wanted is the widest group that still has work for
-    // every lane: 256 is eight elements a lane. The count is a parameter for
-    // the reason RMSNorm.h gives — a prompt step's rows fill the machine on
-    // their own, where a wider group only adds barriers.
-    //
-    // Measured on gemma-2b on an M5 Max: 32 lanes give 48.7 tokens/s, 64 give
-    // 50.0, 128 give 50.8, 256 give 51.8, 512 give 52.0, and 1024 — which
-    // Metal dispatches without complaint — give 51.0. The curve is flat from
-    // 128 up and 256 sits on it.
+    // every lane: 256 is eight elements a lane. Unmeasured here too, and the
+    // count is a parameter for the reason RMSNorm.h gives — a prompt step's
+    // rows fill the machine on their own, where a wider group only adds
+    // barriers.
     static constexpr auto normLanes = 256;
 
     void requireMatchingWeights(const DecoderWeights& weights) const;
     void requirePrepared() const;
+
+    // Whether the four programs a storage needs were built, and the refusal
+    // step() raises when a checkpoint's are not. Both are asked before a step
+    // records anything, so a dispatch below can dereference its optional.
+    bool isPrepared(WeightStorage storage) const;
+    void requirePreparedStorages(const DecoderWeights& weights) const;
+
+    void prepareStorage(eacp::GPU::Device& device, WeightStorage storage);
+
+    void encodeEmbed(eacp::GPU::ComputePass& pass,
+                     const eacp::GPU::BufferRange& tokens,
+                     const TensorBuffer& table,
+                     int tokenCount);
 
     void encodeLayer(eacp::GPU::ComputePass& pass,
                      const DecoderLayerWeights& weights,
@@ -191,14 +223,6 @@ private:
                         int rowStride,
                         int headCount,
                         int rowCount);
-
-    // The gather, through whichever of the three programs reads the storage the
-    // embedding arrived in. The table is the tied logits weight as well, so
-    // this and the logits product read the one buffer.
-    void encodeEmbed(eacp::GPU::ComputePass& pass,
-                     const eacp::GPU::BufferRange& tokens,
-                     const TensorBuffer& table,
-                     int tokenCount);
 
     void encodeNorm(eacp::GPU::ComputePass& pass,
                     const eacp::GPU::Buffer& input,
@@ -229,23 +253,35 @@ private:
     DecoderShape decoderShape;
     int decodedPositions = 0;
 
-    Embed embedding;
-    HalfWeightEmbed packedEmbedding;
-    BFloat16WeightEmbed bfloatEmbedding;
     RMSNorm normalisation {normLanes};
-    LinearProduct product;
-    HalfWeightLinearProduct packedProduct;
-    BFloat16WeightLinearProduct bfloatProduct;
-    SplitLinear splitProjection {stepSplitCount};
-    HalfWeightSplitLinear packedSplitProjection {stepSplitCount};
-    BFloat16WeightSplitLinear bfloatSplitProjection {stepSplitCount};
-    SplitLinear splitLogits {logitsSplitCount};
-    HalfWeightSplitLinear packedSplitLogits {logitsSplitCount};
-    BFloat16WeightSplitLinear bfloatSplitLogits {logitsSplitCount};
     RoPE rotation;
     GeGLU gating;
     MultiQueryPrefillAttention prefillAttention;
     MultiQueryDecodeAttention decodeAttention;
+
+    // The four programs a weight storage needs — the gather, the many-row tiled
+    // product, and the split product at each of the two split counts — held
+    // empty until prepare() is given a checkpoint that asks for them. A run
+    // builds one row of this and leaves the other twelve pipelines uncompiled.
+    std::optional<Embed> embedding;
+    std::optional<LinearProduct> product;
+    std::optional<SplitLinear> splitProjection;
+    std::optional<SplitLinear> splitLogits;
+
+    std::optional<HalfWeightEmbed> halfEmbedding;
+    std::optional<HalfWeightLinearProduct> halfProduct;
+    std::optional<HalfWeightSplitLinear> halfSplitProjection;
+    std::optional<HalfWeightSplitLinear> halfSplitLogits;
+
+    std::optional<BFloat16WeightEmbed> bfloatEmbedding;
+    std::optional<BFloat16WeightLinearProduct> bfloatProduct;
+    std::optional<BFloat16WeightSplitLinear> bfloatSplitProjection;
+    std::optional<BFloat16WeightSplitLinear> bfloatSplitLogits;
+
+    std::optional<Int8WeightEmbed> int8Embedding;
+    std::optional<Int8WeightLinearProduct> int8Product;
+    std::optional<Int8WeightSplitLinear> int8SplitProjection;
+    std::optional<Int8WeightSplitLinear> int8SplitLogits;
 
     // The residual stream, which two sublayers add to in place from their last
     // product's store: a layer enters and leaves in hidden, so the next layer

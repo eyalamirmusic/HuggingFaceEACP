@@ -125,6 +125,63 @@ inline Vector<float> packedHalves(const Vector<float>& values,
     return words;
 }
 
+// bfloat16s the same way, through eacp's own host converter rather than a
+// cast: bf16 is not a type either compiler has, and bfloat16FromFloat is the
+// encoding readBFloat16 widens back, rounding included.
+inline Vector<float> packedBFloat16s(const Vector<float>& values,
+                                     Vector<float>& widened)
+{
+    auto words = zeroes((values.size() + 1) / 2);
+    widened = sized(values.size());
+
+    for (auto i = 0; i < values.size(); ++i)
+    {
+        const auto bits = eacp::GPU::bfloat16FromFloat(values[i]);
+        widened[i] = eacp::GPU::bfloat16ToFloat(bits);
+
+        auto word = std::uint32_t {};
+        std::memcpy(&word, &words[i / 2], sizeof(word));
+        word |= (std::uint32_t) bits << (16 * (i % 2));
+        std::memcpy(&words[i / 2], &word, sizeof(word));
+    }
+
+    return words;
+}
+
+// The quantized form, which unlike the two above narrows no element on its own:
+// it is a block format, thirty-two weights against one fp16 scale, written by
+// the very function the loader calls and read back by the dequantizer beside
+// it. So what it leaves in `widened` is what the shader reads — the reference
+// runs on the numbers the kernel has rather than on the ones the test started
+// from, exactly as it does for the two packings above.
+//
+// values.size() must be a whole number of scale words, which is what
+// quantizesAsInt8Blocks asks of a tensor; a check picks its shapes for that.
+inline Vector<float> quantizedInt8Blocks(const Vector<float>& values,
+                                         Vector<float>& widened)
+{
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize((int) int8BlocksByteCount(values.size()));
+
+    quantizeInt8Blocks(Span<const float> {values.data(), values.size()},
+                       Span<std::uint8_t> {bytes.data(), bytes.size()});
+
+    widened = sized(values.size());
+
+    dequantizeInt8Blocks(Span<const std::uint8_t> {bytes.data(), bytes.size()},
+                         Span<float> {widened.data(), widened.size()});
+
+    auto words = zeroes(bytes.size() / (int) sizeof(float));
+    std::memcpy(words.data(), bytes.data(), (std::size_t) bytes.size());
+
+    return words;
+}
+
+// Which of the three storages a check narrows its weights through, so one check
+// serves every non-float form of a program: the words it returns are the buffer
+// the kernel reads, and what it leaves in `widened` is what the reference sees.
+using WeightPacker = Vector<float> (*)(const Vector<float>&, Vector<float>&);
+
 // What every check below asks of a product whose inner extent is a few dozen
 // terms. Long sums want more — see dotProductTolerance.
 inline constexpr auto shortSumTolerance = 1e-5;
@@ -170,7 +227,11 @@ void checkLinear(int rows,
 }
 
 template <typename Program>
-void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
+void checkPackedLinear(int rows,
+                       int inner,
+                       int columns,
+                       unsigned seed,
+                       WeightPacker pack = packedHalves)
 {
     auto shape = TiledMatMulShape::forLinear(rows, inner, columns);
     auto a = spreadValues(rows * inner, seed, 2.f);
@@ -178,7 +239,7 @@ void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
     auto bias = spreadValues(columns, seed + 2u, 1.f);
 
     auto widened = Vector<float> {};
-    auto packed = packedHalves(weights, widened);
+    auto packed = pack(weights, widened);
 
     auto kernel = Program {};
     auto result = run(kernel, a, storageOf(packed), bias, shape, rows * columns);
@@ -189,41 +250,37 @@ void checkPackedLinear(int rows, int inner, int columns, unsigned seed)
             a, widened, bias, shape, OperandLayout::ContiguousK, rows * columns));
 }
 
-// The bf16 form, asserted twice over: against the same scalar reference the
-// float product answers to, and against the float product itself.
+// The same product over a prefix of each weight row: the weight is
+// [columns, stride] and the sum takes only the first `inner` of each row.
 //
-// The second is the property the packed path is worth having for. Widening a
-// bf16 is the sixteen bits back at the top of a word and nothing else, so the
-// two programs multiply and add identical float32 numbers in identical order,
-// and "the same answer" means bit for bit rather than to a tolerance. A packed
-// read that dropped a bit, picked the wrong half of a word or rounded on the
-// way in would still pass a tolerance and fails this.
-template <typename Program, typename FloatProgram>
-void checkPackedBFloat16Linear(int rows, int inner, int columns, unsigned seed)
+// Nothing in the model dispatches this — a projection reads its whole row — and
+// it is here to reach the one branch a whole-row quantized product cannot. The
+// block format asks that a weight's contiguous dimension be a whole number of
+// thirty-twos, so a staging thread's run of eight never straddles the inner
+// extent and the wide quantized read is always the branch taken; a prefix that
+// ends mid-slab is what makes the thread fall back to the element-at-a-time
+// loop beside it, which is the code path this covers.
+template <typename Program>
+void checkPackedLinearOverPrefix(
+    int rows, int inner, int stride, int columns, unsigned seed, WeightPacker pack)
 {
     auto shape = TiledMatMulShape::forLinear(rows, inner, columns);
+    shape.bStride = stride;
+
     auto a = spreadValues(rows * inner, seed, 2.f);
-    auto weights = spreadValues(columns * inner, seed + 1u, 3.f);
+    auto weights = spreadValues(columns * stride, seed + 1u, 3.f);
     auto bias = spreadValues(columns, seed + 2u, 1.f);
 
     auto widened = Vector<float> {};
-    auto packed = packedBFloat16Storage(weights, widened);
+    auto packed = pack(weights, widened);
 
     auto kernel = Program {};
-    auto result = run(kernel, a, packed, bias, shape, rows * columns);
+    auto result = run(kernel, a, storageOf(packed), bias, shape, rows * columns);
 
     checkMatches(
         result,
         reference(
-            a, widened, bias, shape, OperandLayout::ContiguousK, rows * columns),
-        dotProductTolerance(inner));
-
-    auto floatKernel = FloatProgram {};
-    auto floatResult =
-        run(floatKernel, a, storageOf(widened), bias, shape, rows * columns);
-
-    for (auto i = 0; i < result.size(); ++i)
-        nano::check(result[i] == floatResult[i]);
+            a, widened, bias, shape, OperandLayout::ContiguousK, rows * columns));
 }
 
 // Attention scores as a decoder computes them: one batch per head over the

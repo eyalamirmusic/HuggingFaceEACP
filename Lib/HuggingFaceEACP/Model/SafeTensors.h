@@ -34,25 +34,51 @@ struct TensorInfo
     std::int64_t dimension(int index) const;
 };
 
+// How a buffer's bytes are arranged, beside what `storage` says each of them
+// is. Elements is every tensor a checkpoint ships: one element after another,
+// nothing else in the buffer. Int8Blocks is the quantized form this tree makes
+// rather than reads — the elements as signed bytes followed by one fp16 scale
+// per block of thirty-two, which is Kernels/Int8Blocks.h's layout — and it is a
+// second axis rather than a fourteenth TensorType because no safetensors dtype
+// names it and its `storage` is honestly I8.
+enum class BufferLayout
+{
+    Elements,
+    Int8Blocks
+};
+
 // A tensor uploaded to the device, and what the buffer's elements are: F32 for
-// the float buffer a kernel subscripts, F16 and BF16 for one still packed two
-// 16-bit floats to a word, which a kernel reads through InputBuffer::readHalf
-// or readBFloat16.
+// the float buffer a kernel subscripts, F16 or BF16 for one still packed two
+// sixteen-bit floats to a word, which a kernel reads through
+// InputBuffer::readHalf or InputBuffer::readBFloat16, and I8 in the block
+// layout above for one the loader quantized.
 //
-// The three travel together because nothing about a GPU::Buffer says which of
+// The two travel together because nothing about a GPU::Buffer says which of
 // them it holds, and binding a packed buffer where a float one is expected is
 // wrong by a factor of two in every index while staying silent on both
-// backends. The two packed cases are as far from each other: bfloat16 has
-// eight exponent bits and fp16 five, so reading one as the other is not a
-// coarser number, it is a different one.
+// backends. The two packed cases are not interchangeable either: bf16 has eight
+// exponent bits against fp16's five, so a bf16 buffer read through readHalf is
+// not less precise, it is wrong.
 struct TensorBuffer
 {
     eacp::GPU::Buffer buffer;
     TensorType storage = TensorType::F32;
+    BufferLayout layout = BufferLayout::Elements;
 
     bool isPackedHalf() const { return storage == TensorType::F16; }
     bool isPackedBFloat16() const { return storage == TensorType::BF16; }
+    bool isInt8Blocks() const { return layout == BufferLayout::Int8Blocks; }
 };
+
+// A run of a tensor's elements widened to float32, for a caller walking a large
+// tensor a piece at a time rather than holding all of it: `bytes` are the
+// tensor's own, `first` is the element to begin at, and `destination` says how
+// many to take. Exactly the widening readFloats does — F16 and BF16 both widen
+// exactly — and a type no shader reads is a ModelError naming the tensor.
+void widenTensorElements(const TensorInfo& tensor,
+                         Span<const std::uint8_t> bytes,
+                         std::int64_t first,
+                         Span<float> destination);
 
 // A safetensors file: eight bytes of little-endian header length, that many
 // bytes of JSON naming every tensor, then one raw blob the offsets in that JSON
@@ -108,17 +134,17 @@ public:
     void readFloats(std::string_view name, Span<float> destination) const;
 
     // F32, F16 and BF16 go to the device as they lie in the blob — the first is
-    // the float buffer a kernel subscripts, the other two the packed ones
-    // readHalf and readBFloat16 read, a 16-bit pair to a little-endian word in
-    // the file and the same word on the device — so none of the three costs a
-    // widened copy. F64 has no shader read of its own and is widened here.
+    // the float buffer a kernel subscripts, the other two the packed pairs
+    // readHalf and readBFloat16 read — so none of the three costs a widened
+    // copy. Anything else has no shader read of its own and is widened here.
     TensorBuffer makeBuffer(std::string_view name) const;
 
-    // Widened to F32 whatever the file holds, for a tensor bound to a program
-    // that has no packed read at all — the norm scales, which are a row each
-    // rather than a matrix, so the copy the packed path exists to avoid is
-    // kilobytes here.
-    TensorBuffer makeWidenedBuffer(std::string_view name) const;
+    // The same upload, widened to F32 whatever the blob holds, for the tensors
+    // bound to a program that only subscripts floats. Gemma's norm scales are
+    // the ones that ask: 2048 floats apiece against a packed read that would
+    // have to exist in RMSNorm, Argmax and everything else a small tensor
+    // reaches.
+    TensorBuffer makeFloatBuffer(std::string_view name) const;
 
 private:
     // Which of the three constructions the bytes came from. Kept as a state
@@ -133,6 +159,11 @@ private:
     };
 
     SafeTensors() = default;
+
+    // What both uploads fall back on when the blob is not a layout a kernel
+    // reads, and what makeFloatBuffer is for a packed tensor: widened once here
+    // rather than in every kernel that might meet one.
+    TensorBuffer widenedBuffer(const TensorInfo& tensor) const;
 
     Span<const std::uint8_t> fileBytes() const;
 

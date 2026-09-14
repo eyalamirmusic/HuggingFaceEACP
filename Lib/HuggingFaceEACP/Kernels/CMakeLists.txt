@@ -6,6 +6,7 @@ target_link_libraries(hf-kernels PUBLIC hf-core)
 
 target_sources(hf-kernels PRIVATE
         Argmax.cpp
+        Int8Blocks.cpp
         Kernels.cpp
         MultiQueryAttention.cpp
         RoPE.cpp)

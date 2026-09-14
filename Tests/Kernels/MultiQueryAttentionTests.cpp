@@ -1,5 +1,7 @@
 #include "ReferenceAttention.h"
 
+#include <iostream>
+
 using namespace nano;
 using namespace HF;
 using namespace HF::Reference;
@@ -238,4 +240,53 @@ auto tPrefillMatchesDecodeSteps =
                           (double) decoded[channel],
                           tolerance));
     }
+};
+
+// What this kernel's threadgroup arrays actually cost, measured rather than
+// written down in a comment. Two claims, and the second is the one the kernel's
+// whole layout rests on:
+//
+//   - the column-major fold declares its one head-wide accumulator and its
+//     tile of weights, and that fits the device;
+//   - the lane-major fold it was written instead of — a head-wide row of
+//     accumulators per lane — does not, at Gemma's head width of 256.
+//
+// The budget is the device's own. It is 32 KB on Metal and at D3D's cs_5_0, and
+// a Vulkan device meeting only the spec floor gives 16 KB; the rejected layout
+// is past all three, which is why the assertion is against the number rather
+// than against a constant.
+auto tAttentionFitsTheThreadgroupBudget =
+    test("Kernels/multiQueryAttentionFitsTheThreadgroupBudget") = []
+{
+    auto& device = Device::shared();
+
+    if (!device.isValid())
+        return;
+
+    constexpr auto headWidth = MultiQueryAttentionProgram::maxHeadDim;
+    constexpr auto lanes = MultiQueryAttentionProgram::laneCount;
+    constexpr auto declared = (int) sizeof(float) * (headWidth + lanes);
+
+    check(headWidth == gemmaShape.headDim);
+
+    auto prefill = MultiQueryPrefillAttention {};
+    auto decode = MultiQueryDecodeAttention {};
+
+    // At least, not exactly: the emitter adds its own scratch behind the
+    // shared<> arrays for the group reductions this kernel folds through.
+    check(prefill.threadgroupMemoryBytes() >= declared);
+    check(decode.threadgroupMemoryBytes() >= declared);
+
+    check(device.maxThreadgroupMemory() > 0);
+    check(prefill.fitsThreadgroupMemory(device));
+    check(decode.fitsThreadgroupMemory(device));
+
+    // The layout this kernel exists instead of, against the same budget.
+    constexpr auto perLane = (int) sizeof(float) * lanes * headWidth;
+
+    check(perLane > device.maxThreadgroupMemory());
+
+    std::cout << "  attention declares " << prefill.threadgroupMemoryBytes()
+              << " bytes of " << device.maxThreadgroupMemory()
+              << "; the lane-major fold would want " << perLane << "\n";
 };

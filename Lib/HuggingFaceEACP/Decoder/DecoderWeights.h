@@ -1,10 +1,16 @@
 #pragma once
 
 #include <HuggingFaceEACP/Decoder/DecoderShape.h>
-#include <HuggingFaceEACP/Model/ShardedTensors.h>
+#include <HuggingFaceEACP/Model/TensorLoader.h>
 
 namespace HF
 {
+// Which of the four product programs a buffer is readable by. The loader
+// decided it when it uploaded the tensor, and nothing about a GPU::Buffer
+// carries it, which is why TensorBuffer holds the buffer and its storage
+// together.
+WeightStorage weightStorageOf(const TensorBuffer& weight);
+
 // One decoder block's tensors, under the names google/gemma-2b ships them —
 // model.layers.<index>.self_attn.q_proj.weight and the rest, spelled once in
 // Model/GemmaTensors.h so that nothing here is a convention that could drift
@@ -25,27 +31,31 @@ namespace HF
 // fifth step goes one further and folds the multiply into the down product's
 // operand read; this is the shape that step starts from.
 //
-// **Storage.** Every weight here reaches the device in the storage the
-// checkpoint ships it in: Gemma's own BF16, or the fp16 a converted repo may
-// carry, both two values to a word and read there by readBFloat16 or readHalf.
-// The products and the embedding gather have a variant per storage and the
-// Decoder picks it by TensorBuffer::storage, since nothing about a GPU buffer
-// says which one it holds. The norm scales are the exception — RMSNorm
-// subscripts floats and has no packed read — so loadFloatTensor widens those,
-// which is a row of a weight rather than a matrix.
+// **Storage.** Every weight a product kernel reads arrives as the checkpoint
+// ships it, packed or not: Gemma's own are BF16, a converted repo's may be
+// fp16, and the product kernels have a variant per storage that the Decoder
+// picks by TensorBuffer::storage. That includes the fused gate-and-up weight,
+// which is stacked as raw bytes rather than concatenated through readFloats, so
+// a packed pair stays packed — see TensorLoader::loadStackedProjectionWeights.
 //
-// The fused gate-and-up weight is stacked out of the two tensors' raw bytes
-// when both are packed in the same storage, so the largest weight in the layer
-// stays packed through the concatenation rather than being widened to be
-// joined. A 16-bit pair shares a word, so that needs the gate half to be a
-// whole number of words — which every real shape is, the intermediate width
-// and the model width both being even — and a half that is not falls back to
-// widening both.
+// **Or quantized, when the caller asks.** WeightPrecision::Int8Blocks makes
+// every one of those tensors on the way up instead of taking it as it lies:
+// thirty-two elements to a block, one fp16 scale each, 1.0625 bytes an element
+// against bf16's two. The precision is the caller's because it is a trade
+// rather than a fact about the checkpoint — bytes per token against a little
+// accuracy per element — and AsShipped stays the default so nothing changes for
+// a caller that has not asked.
+//
+// **The two norm scales are the exception, and are widened to F32.** They are
+// [width] each, 8 kB a layer, and the alternative is a packed read in RMSNorm
+// for a tensor whose bytes are a rounding error against the projections beside
+// it. loadFloatTensor is what widens them.
 struct DecoderLayerWeights
 {
     DecoderLayerWeights(const ShardedTensors& file,
                         const DecoderShape& shape,
-                        int index);
+                        int index,
+                        WeightPrecision precision = WeightPrecision::AsShipped);
 
     TensorBuffer inputNorm;
     TensorBuffer query;
@@ -69,15 +79,28 @@ struct DecoderLayerWeights
 // that shipped an untied head would be a different architecture rather than a
 // variant of this one.
 //
-// embed_tokens is therefore the tensor bound twice — as the gather's table and
-// as the logits weight — and both readers take it in whatever storage it
-// arrived in, so the one buffer serves both and the tie stays exact rather than
-// exact up to a conversion. At Gemma's width that is 1.05 GB rather than the
-// 2.10 GB a widened copy would be, which is also what keeps it inside the
-// 32-bit byte count a GPU::Buffer is described by.
+// embed_tokens is therefore the tensor bound twice, and both readers take it in
+// whatever the checkpoint stored: EmbedProgram and the products are each
+// parameterised by WeightStorage, and both widen a packed element through the
+// same call. At Gemma's [256000, 2048] that is 1.05 GB bound twice rather than
+// 2.10 GB — the largest single saving the packed path makes, and what kept the
+// gather from forcing the whole embedding to be widened for the sake of one
+// subscript.
 struct DecoderWeights
 {
-    DecoderWeights(const ShardedTensors& file, const DecoderShape& shapeToUse);
+    DecoderWeights(const ShardedTensors& file,
+                   const DecoderShape& shapeToUse,
+                   WeightPrecision precision = WeightPrecision::AsShipped);
+
+    // Every distinct storage the weights above a product or the gather reads
+    // are in, which for a real checkpoint is one entry. Decoder::prepare
+    // compiles the programs these name and no others — four storages times a
+    // tiled product, two split products and a gather is sixteen pipelines, of
+    // which a run dispatches four.
+    //
+    // The norm scales are not in here. They are widened to F32 on the way up
+    // and bound to RMSNorm, which has no storage to pick.
+    Vector<WeightStorage> storages() const;
 
     DecoderShape shape;
 

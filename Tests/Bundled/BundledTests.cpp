@@ -151,3 +151,42 @@ auto tBundledModelGenerates = test("Bundled/modelGenerates") = []
 
     std::cout << "  \"" << capitalPrompt << "\" ->\"" << text << "\"\n";
 };
+
+// The same run on the quantized path, out of the same copy beside the binary:
+// the weights are read from the bundled safetensors and quantized into int8
+// blocks on the way to the device, so what this says is that plan.md's sixth
+// gap works against the real checkpoint and not only against a synthetic one.
+//
+// Which words come back is Tests/Oracle's assertion at this precision, not
+// this one — here it is the copy, the quantizer over 2.5 billion real
+// parameters, and the four pipelines that storage compiles.
+auto tBundledModelGeneratesQuantized = test("Bundled/modelGeneratesQuantized") = []
+{
+    if (!bundlesModel || !Device::shared().isValid() || !Gemma::hasBundledModel())
+        return;
+
+    auto gemma = Gemma {};
+    gemma.loadBundled();
+    gemma.setWeightPrecision(WeightPrecision::Int8Blocks);
+    gemma.prepare();
+
+    gemma.setMaximumTokens(smokeTokens);
+
+    const auto storages = gemma.weightStorages();
+
+    check(storages.size() == 1);
+    check(storages[0] == WeightStorage::Int8Blocks);
+
+    const auto tokens = gemma.generateFromText(capitalPrompt);
+    const auto text = gemma.textForTokens(tokens);
+
+    check(tokens.size() > 0);
+    check(tokens.size() <= smokeTokens);
+
+    for (const auto token: tokens)
+        check(token >= 0 && token < gemma.config().vocabularySize);
+
+    check(!text.empty());
+
+    std::cout << "  int8: \"" << capitalPrompt << "\" ->\"" << text << "\"\n";
+};

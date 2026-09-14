@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace HF
 {
@@ -102,6 +103,53 @@ void dispatchProduct(SplitLinearProgram<weightStorage>& program,
 
     program.dispatch(pass, outputWidth, rowCount);
 }
+
+// eacp's own prepare() names a threadgroup overspend in the log and then lets
+// the backend refuse the pipeline, which on Metal happens after the library
+// compiled clean and points at the wrong thing. Here the tiles are sized from a
+// config, so an overspend is a shape a checkpoint asked for: it is named by
+// kernel and by both numbers, and it is raised before a pipeline is built.
+//
+// The two numbers are the device's rather than a constant written down — the
+// budget is 32 KB on Metal, the same at D3D's cs_5_0, and as little as 16 KB on
+// a Vulkan device that only meets the spec floor.
+template <typename Program>
+void prepareWithinBudget(Program& program, Device& device, std::string_view kernel)
+{
+    if (!program.fitsThreadgroupMemory(device))
+        throw ModelError {"the " + std::string {kernel} + " kernel declares "
+                          + std::to_string(program.threadgroupMemoryBytes())
+                          + " bytes of threadgroup memory and this device allows "
+                          + std::to_string(device.maxThreadgroupMemory())};
+
+    program.prepare(device);
+}
+
+// The four programs one weight storage needs, built and compiled together
+// because a checkpoint that asks for any of them asks for all four. Idempotent,
+// so a storage named twice by the weights costs one compile.
+template <typename Gather, typename Product, typename Split>
+void prepareVariant(Device& device,
+                    std::optional<Gather>& gather,
+                    std::optional<Product>& product,
+                    std::optional<Split>& projection,
+                    std::optional<Split>& logits,
+                    int projectionSplits,
+                    int logitSplits)
+{
+    if (gather)
+        return;
+
+    gather.emplace();
+    product.emplace();
+    projection.emplace(projectionSplits);
+    logits.emplace(logitSplits);
+
+    prepareWithinBudget(*gather, device, "embedding gather");
+    prepareWithinBudget(*product, device, "tiled product");
+    prepareWithinBudget(*projection, device, "split projection");
+    prepareWithinBudget(*logits, device, "split logits");
+}
 } // namespace
 
 Decoder::Decoder(const DecoderShape& shapeToUse)
@@ -121,27 +169,18 @@ Decoder::Decoder(const DecoderShape& shapeToUse)
 // than the weights of the layer that reads them, for buffers a decode step uses
 // one row of. A generation loop sets maxStepRows to its prompt capacity and
 // pays for that many rows instead.
-void Decoder::prepare(Device& device)
+void Decoder::prepare(Device& device, const DecoderWeights& weights)
 {
     decoderShape.validate();
 
-    embedding.prepare(device);
-    packedEmbedding.prepare(device);
-    bfloatEmbedding.prepare(device);
-    normalisation.prepare(device);
-    product.prepare(device);
-    packedProduct.prepare(device);
-    bfloatProduct.prepare(device);
-    splitProjection.prepare(device);
-    packedSplitProjection.prepare(device);
-    bfloatSplitProjection.prepare(device);
-    splitLogits.prepare(device);
-    packedSplitLogits.prepare(device);
-    bfloatSplitLogits.prepare(device);
-    rotation.prepare(device);
-    gating.prepare(device);
-    prefillAttention.prepare(device);
-    decodeAttention.prepare(device);
+    for (auto storage: weights.storages())
+        prepareStorage(device, storage);
+
+    prepareWithinBudget(normalisation, device, "RMSNorm");
+    prepareWithinBudget(rotation, device, "RoPE");
+    prepareWithinBudget(gating, device, "GeGLU");
+    prepareWithinBudget(prefillAttention, device, "prefill attention");
+    prepareWithinBudget(decodeAttention, device, "decode attention");
 
     const auto stepElements = decoderShape.stepElementCount();
 
@@ -178,9 +217,70 @@ void Decoder::prepare(Device& device)
     decodedPositions = 0;
 }
 
-void Decoder::prepare()
+void Decoder::prepare(const DecoderWeights& weights)
 {
-    prepare(Device::shared());
+    prepare(Device::shared(), weights);
+}
+
+void Decoder::prepareStorage(Device& device, WeightStorage storage)
+{
+    if (storage == WeightStorage::PackedHalf)
+    {
+        prepareVariant(device,
+                       halfEmbedding,
+                       halfProduct,
+                       halfSplitProjection,
+                       halfSplitLogits,
+                       stepSplitCount,
+                       logitsSplitCount);
+        return;
+    }
+
+    if (storage == WeightStorage::PackedBFloat16)
+    {
+        prepareVariant(device,
+                       bfloatEmbedding,
+                       bfloatProduct,
+                       bfloatSplitProjection,
+                       bfloatSplitLogits,
+                       stepSplitCount,
+                       logitsSplitCount);
+        return;
+    }
+
+    if (storage == WeightStorage::Int8Blocks)
+    {
+        prepareVariant(device,
+                       int8Embedding,
+                       int8Product,
+                       int8SplitProjection,
+                       int8SplitLogits,
+                       stepSplitCount,
+                       logitsSplitCount);
+        return;
+    }
+
+    prepareVariant(device,
+                   embedding,
+                   product,
+                   splitProjection,
+                   splitLogits,
+                   stepSplitCount,
+                   logitsSplitCount);
+}
+
+bool Decoder::isPrepared(WeightStorage storage) const
+{
+    if (storage == WeightStorage::PackedHalf)
+        return halfProduct.has_value();
+
+    if (storage == WeightStorage::PackedBFloat16)
+        return bfloatProduct.has_value();
+
+    if (storage == WeightStorage::Int8Blocks)
+        return int8Product.has_value();
+
+    return product.has_value();
 }
 
 void Decoder::requireMatchingWeights(const DecoderWeights& weights) const
@@ -190,11 +290,75 @@ void Decoder::requireMatchingWeights(const DecoderWeights& weights) const
                           "shape than this decoder was built for"};
 }
 
+// Before a step records anything, for the reason every other check in step() is
+// there: the programs a storage needs are compiled by prepare() from the
+// weights it was given, so a checkpoint swapped for one in another storage has
+// no pipeline to dispatch and half a pass would already be recorded by the time
+// a dispatch found out.
+void Decoder::requirePreparedStorages(const DecoderWeights& weights) const
+{
+    for (auto storage: weights.storages())
+        if (!isPrepared(storage))
+            throw ModelError {"these weights are in a storage this decoder was "
+                              "not prepared for: prepare() compiles the product "
+                              "programs the checkpoint it is given needs, and "
+                              "no others"};
+}
+
 void Decoder::requirePrepared() const
 {
     if (!hidden)
         throw ModelError {"this decoder has not been prepared: prepare() is what "
                           "compiles its kernels and sizes its caches"};
+}
+
+// The gather picks its program by the table's storage the way a product picks
+// its own, and for the same reason: the tied embedding is the one tensor bound
+// to two kinds of kernel, so both have to read whatever the checkpoint shipped
+// rather than the gather forcing it to be widened.
+void Decoder::encodeEmbed(ComputePass& pass,
+                          const BufferRange& tokens,
+                          const TensorBuffer& table,
+                          int tokenCount)
+{
+    auto dispatchThrough = [&](auto& program)
+    {
+        program.tokens = tokens;
+        program.tokenTable = table.buffer;
+        program.output = *hidden;
+        program.width = (std::uint32_t) decoderShape.width;
+        program.scale = decoderShape.embeddingScale;
+
+        // Where a quantized table's per-block scales begin, in halves — see
+        // EmbedProgram::blockScales for why the gather is the one kernel told
+        // rather than the one that works it out. Set whatever the storage is,
+        // since only the quantized gather reads it and a branch here would say
+        // less than the number does.
+        program.blockScales =
+            (std::uint32_t) ((std::int64_t) decoderShape.vocabularySize
+                             * decoderShape.width / 2);
+
+        pass.dispatch(program, decoderShape.width, tokenCount);
+    };
+
+    switch (weightStorageOf(table))
+    {
+        case WeightStorage::PackedHalf:
+            dispatchThrough(*halfEmbedding);
+            return;
+
+        case WeightStorage::PackedBFloat16:
+            dispatchThrough(*bfloatEmbedding);
+            return;
+
+        case WeightStorage::Int8Blocks:
+            dispatchThrough(*int8Embedding);
+            return;
+
+        case WeightStorage::Float:
+            dispatchThrough(*embedding);
+            return;
+    }
 }
 
 void Decoder::encodeNorm(ComputePass& pass,
@@ -212,11 +376,11 @@ void Decoder::encodeNorm(ComputePass& pass,
     normalisation.dispatchRows(pass, rowCount);
 }
 
-// One of the two places a weight's storage decides anything: a tensor the
-// checkpoint shipped packed goes to the program compiled to read that packing,
-// and one that arrived as floats to the program that subscripts floats. None of
-// the three can read another's buffer, which is why the choice is made from the
-// buffer rather than from a build-time switch.
+// The one place a weight's storage decides anything: a tensor the loader left
+// packed goes to the program that reads that packing, and one it uploaded as
+// floats to the program that subscripts floats. None of the three can read
+// another's buffer, which is why the choice is made from the buffer rather than
+// from a build-time switch.
 //
 // The row count decides the other axis. The split form gives every lane of a
 // group a share of one output's inner sum, which is what a one-row decode step
@@ -236,7 +400,7 @@ void Decoder::encodeProduct(ComputePass& pass,
     const auto fewRows = rowCount <= splitRowLimit;
     const auto logits = role == ProductRole::Logits;
 
-    auto dispatch = [&](auto& program)
+    auto dispatchThrough = [&](auto& program)
     {
         dispatchProduct(program,
                         pass,
@@ -250,54 +414,37 @@ void Decoder::encodeProduct(ComputePass& pass,
                         residual);
     };
 
-    if (weight.isPackedBFloat16())
+    // The tiled and split forms are different types, so which one runs is a
+    // branch rather than a reference the two could share.
+    auto dispatchOneOf = [&](auto& tiled, auto& split, auto& splitForLogits)
     {
-        if (fewRows)
-            dispatch(logits ? bfloatSplitLogits : bfloatSplitProjection);
+        if (!fewRows)
+            dispatchThrough(tiled);
+        else if (logits)
+            dispatchThrough(splitForLogits);
         else
-            dispatch(bfloatProduct);
-    }
-    else if (weight.isPackedHalf())
-    {
-        if (fewRows)
-            dispatch(logits ? packedSplitLogits : packedSplitProjection);
-        else
-            dispatch(packedProduct);
-    }
-    else
-    {
-        if (fewRows)
-            dispatch(logits ? splitLogits : splitProjection);
-        else
-            dispatch(product);
-    }
-}
-
-// The other place: the gather reads the tied embedding where it lies, so the
-// one buffer serves it and the logits product above without a second copy of
-// the largest tensor in the model.
-void Decoder::encodeEmbed(ComputePass& pass,
-                          const BufferRange& tokens,
-                          const TensorBuffer& table,
-                          int tokenCount)
-{
-    auto dispatch = [&](auto& program)
-    {
-        program.tokens = tokens;
-        program.tokenTable = table.buffer;
-        program.output = *hidden;
-        program.width = (std::uint32_t) decoderShape.width;
-        program.scale = decoderShape.embeddingScale;
-
-        pass.dispatch(program, decoderShape.width, tokenCount);
+            dispatchThrough(split);
     };
 
-    if (table.isPackedBFloat16())
-        dispatch(bfloatEmbedding);
-    else if (table.isPackedHalf())
-        dispatch(packedEmbedding);
-    else
-        dispatch(embedding);
+    switch (weightStorageOf(weight))
+    {
+        case WeightStorage::PackedHalf:
+            dispatchOneOf(*halfProduct, *halfSplitProjection, *halfSplitLogits);
+            return;
+
+        case WeightStorage::PackedBFloat16:
+            dispatchOneOf(
+                *bfloatProduct, *bfloatSplitProjection, *bfloatSplitLogits);
+            return;
+
+        case WeightStorage::Int8Blocks:
+            dispatchOneOf(*int8Product, *int8SplitProjection, *int8SplitLogits);
+            return;
+
+        case WeightStorage::Float:
+            dispatchOneOf(*product, *splitProjection, *splitLogits);
+            return;
+    }
 }
 
 // Appending to the cache is a bind, not a copy: the key and value projections
@@ -502,6 +649,7 @@ void Decoder::step(ComputePass& pass,
 {
     requirePrepared();
     requireMatchingWeights(weights);
+    requirePreparedStorages(weights);
 
     if (tokenCount <= 0)
         throw ModelError {"a decoder step needs at least one token"};

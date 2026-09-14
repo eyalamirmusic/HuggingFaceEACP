@@ -1,10 +1,10 @@
-# NO_MAIN, for one test's sake: almost everything here stops at the CPU side,
-# but which storage makeBuffer leaves a tensor in is this module's decision
-# rather than eacp's — a packed one has to reach the device as the bytes the
-# file holds — and asserting it means uploading one, which needs a device and
-# therefore eacp's event loop through the shared entry point in Tests/Support.
-# Every test that reaches the device returns early without one, so the suite
-# still runs on a machine that has none.
+# NO_MAIN: nearly nothing here reaches the device — every reader below stops at
+# the CPU side and asserts against bytes this suite wrote itself. The exception
+# is TensorUploadTests.cpp, and it is the exception for a reason: what a tensor
+# is uploaded *as* became a claim worth testing once a BF16 weight started going
+# to the device packed, and a buffer's storage and its size are only visible
+# there. So the suite takes the shared entry point, and those tests alone return
+# early when there is no device — the rest still run on a machine with none.
 nano_add_executable(ModelTests
         NO_MAIN
         SOURCES
@@ -13,5 +13,6 @@ nano_add_executable(ModelTests
         ConfigTests.cpp
         SafeTensorsTests.cpp
         ShardedTensorsTests.cpp
+        TensorUploadTests.cpp
         ${HF_GPU_TEST_MAIN}
         TARGETS hf-model)

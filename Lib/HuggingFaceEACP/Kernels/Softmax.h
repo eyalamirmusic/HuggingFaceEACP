@@ -48,7 +48,7 @@ struct Softmax final : ReducingProgram
                  scanning += lanes;
              });
 
-        auto rowMaximum = var(groupMax(largest.get()));
+        auto rowMaximum = var(foldMax(largest.get()));
 
         auto total = var(0.f);
         auto summing = var(lane);
@@ -64,7 +64,7 @@ struct Softmax final : ReducingProgram
                  summing += lanes;
              });
 
-        auto normaliser = var(1.f / groupSum(total.get()));
+        auto normaliser = var(1.f / foldSum(total.get()));
         auto scaling = var(lane);
 
         loop(scaling.get() < rowLength,

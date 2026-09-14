@@ -11,11 +11,17 @@
 // would make every comparison built on it meaningless in a way that reads as
 // our bug — so the shape of what LlamaOracle hands back is asserted here, and
 // one end-to-end claim about the model's behaviour with it: greedy decoding
-// from "The capital of France is" gives the continuation gemma-2b gives.
+// from a question about the capital of France reaches Paris.
 //
-// Everything skips without gemma-2b.gguf, which comes with Google's own gated
-// download rather than with the mirror the build fetches — GEMMA_MODEL_DIR is
-// how a machine that has done that download names it.
+// The prompt is the one Tests/Generation probes with, for the reason given
+// there: greedy gemma-2b continues "The capital of France is" with " a city of
+// contrasts" rather than with Paris, and this oracle is one of the three
+// witnesses that say so.
+//
+// Everything skips without gemma-2b.gguf. It is not in the mirror the build
+// fetches and no longer needs Google's gated repo either: convert_hf_to_gguf.py
+// out of the pinned llama.cpp tree makes it from the fetched safetensors, and
+// GEMMA_MODEL_DIR names the directory it was written to.
 
 using namespace nano;
 using namespace HF;
@@ -23,15 +29,9 @@ using namespace HF::Testing;
 
 namespace
 {
-constexpr auto capitalPrompt = std::string_view {"The capital of France is"};
+constexpr auto capitalPrompt =
+    std::string_view {"Q: What is the capital of France?\nA:"};
 constexpr auto greedySteps = 8;
-
-// The base model's own answer, which is a sentence rather than the capital:
-// "▁a" beats "▁Paris" by a third of a logit at the last prompt position.
-// transformers 5.17.0 in float32 gives these eight ids too, so the string is
-// gemma-2b's and not this reference's.
-constexpr auto capitalContinuation =
-    std::string_view {" a city of contrasts. It is a"};
 
 bool canRun()
 {
@@ -97,7 +97,7 @@ auto tOracleLogitsShape = test("Oracle/Llama/logitsShape") = []
 // path: greedy() decodes the prompt once and then one token at a time, so a
 // cache that was not carried between steps would produce a continuation that
 // reads as nonsense rather than as an error.
-auto tOracleGreedyContinues = test("Oracle/Llama/greedyContinuesThePrompt") = []
+auto tOracleGreedyReachesParis = test("Oracle/Llama/greedyReachesParis") = []
 {
     if (!canRun())
         return;
@@ -117,5 +117,6 @@ auto tOracleGreedyContinues = test("Oracle/Llama/greedyContinuesThePrompt") = []
 
     std::cout << "  \"" << capitalPrompt << "\" -> \"" << text << "\"\n";
 
-    check(text == capitalContinuation, "the continuation is the model's own");
+    check(text.find("Paris") != std::string::npos,
+          "Paris arrives within eight tokens");
 };

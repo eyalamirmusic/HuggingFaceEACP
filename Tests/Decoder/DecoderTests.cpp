@@ -316,6 +316,59 @@ auto tBeginSequenceResets = test("Decoder/beginSequenceResetsTheSequence") = []
         check(first.hidden[index] == second.hidden[index]);
 };
 
+// The same decoding out of a BF16 checkpoint, which is the storage gemma-2b
+// itself ships and the one the whole model now stays in on the device: every
+// product reads its weight through readBFloat16 and the embedding gather reads
+// the same packed buffer the logits projection does.
+//
+// The reference is not given any allowance for that. It reads the checkpoint
+// through readFloats, which widens the very bytes the shader widens, so both
+// sides run on the bf16-rounded weights and what is left to disagree about is
+// float32 accumulation — the same tolerance the F32 path answers to.
+//
+// Both shapes are here because they are different kernels: the prompt's seven
+// rows take the tiled product and the prefill attention, and the tokens after
+// it take the split product a decode step runs on, which is where the four-wide
+// bf16 read lives.
+auto tBFloat16CheckpointMatchesReference =
+    test("Decoder/bfloat16CheckpointMatchesReference") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-bf16", Sharding::Single, asBFloat16()};
+
+    const auto shape = checkpoint.shape();
+    const auto tokens = promptTokens();
+    const auto expected = decodeOnTheCpu(checkpoint, tokens);
+
+    auto run = DecoderRun {shape, checkpoint.weights()};
+
+    // Said outright rather than left to the loader's own suite, so this test is
+    // self-contained about which path it is exercising: a checkpoint that
+    // arrived widened would still decode correctly here and would be testing
+    // the F32 kernels under a bf16 name.
+    check(run.loaded().tokenEmbedding.isPackedBFloat16());
+    check(run.loaded().layers[0].query.isPackedBFloat16());
+    check(run.loaded().layers[0].fusedGateUp.isPackedBFloat16());
+
+    auto worst = checkStepAgainstReference(
+        run.step(tokens), expected, shape, 0, (int) tokens.size());
+
+    run.beginSequence();
+
+    for (auto index = 0; index < (int) tokens.size(); ++index)
+    {
+        const auto result = run.step({tokens[(std::size_t) index]});
+
+        worst = std::max(
+            worst, checkStepAgainstReference(result, expected, shape, index, 1));
+    }
+
+    std::cout << "  bf16 checkpoint: worst error " << worst << "\n";
+};
+
 // The same decoding out of a checkpoint split across two shards, which is the
 // shape gemma-2b itself ships in. The weights are identical, so this is about
 // the index resolving every name rather than about the arithmetic.
@@ -341,44 +394,70 @@ auto tShardedCheckpointDecodesTheSame =
     std::cout << "  two shards: worst error " << worst << "\n";
 };
 
-// The storage gemma-2b actually ships, which every weight here now keeps all
-// the way to the device: the same forward pass over a checkpoint written in
-// BF16, through the tiled product a prompt takes and the split product a token
-// takes, at the tolerance the F32 checkpoint is held to.
+// plan.md's gap 6: the same forward pass over weights the loader quantized into
+// int8 blocks on the way up. The checkpoint is the ordinary one — nothing about
+// the file changes — and what changes is the precision the loader was asked
+// for, so what this compares is one decoder against one reference over two
+// different sets of numbers for the same model.
 //
-// The tolerance is unchanged because the storage is not a precision: the file
-// holds rounded values, readFloats hands the reference those same rounded
-// values, and the widening a kernel does on the way in is exact. What would
-// fail here is a packed read that landed on the wrong half of a word or a
-// fused weight whose two halves were stacked in the wrong storage — both of
-// which are wrong by whole digits rather than by the seventh.
-auto tBFloat16CheckpointMatchesReference =
-    test("Decoder/bfloat16CheckpointMatchesReference") = []
+// **The reference is given no allowance for the quantization either.** It reads
+// the checkpoint through readFloats and then takes every tensor a product or
+// the gather reads through the very quantizer the loader called and back
+// through its dequantizer, so both sides run on the quantized weights and what
+// is left to disagree about is float32 accumulation — the same tolerance the
+// exact paths answer to. A test that had loosened the tolerance instead would
+// have been measuring the format rather than the kernels.
+//
+// The feed-forward width is 64 rather than the suite's 48, because 48 is not a
+// whole number of blocks and TensorLoader refuses it — see
+// smallQuantizableGemmaConfig, and the refusal itself in DecoderWeightsTests.
+//
+// Both shapes are here for the reason the bf16 case has both: the prompt's
+// seven rows take the tiled product and the prefill attention, and the tokens
+// after it take the split product a decode step runs on.
+auto tInt8CheckpointMatchesReference =
+    test("Decoder/int8CheckpointMatchesReference") = []
 {
     if (!Device::shared().isValid())
         return;
 
-    const auto checkpoint =
-        SyntheticCheckpoint {"decoder-bfloat16", TensorType::BF16};
+    const auto checkpoint = SyntheticCheckpoint {"decoder-int8",
+                                                 Sharding::Single,
+                                                 asBFloat16(),
+                                                 smallQuantizableGemmaConfig()};
 
     const auto shape = checkpoint.shape();
     const auto tokens = promptTokens();
-    const auto expected = decodeOnTheCpu(checkpoint, tokens);
 
-    auto prompt = DecoderRun {shape, checkpoint.weights()};
+    const auto expected = referenceDecode(
+        quantizedReferenceModel(readReferenceModel(checkpoint.weights(), shape)),
+        shape,
+        tokens);
+
+    auto run = DecoderRun {shape, checkpoint.weights(), WeightPrecision::Int8Blocks};
+
+    // Said outright rather than left to the loader's own suite, so this test is
+    // self-contained about which path it is exercising: a checkpoint that
+    // arrived packed would still decode correctly here and would be testing the
+    // bf16 kernels under an int8 name.
+    check(run.loaded().tokenEmbedding.isInt8Blocks());
+    check(run.loaded().layers[0].query.isInt8Blocks());
+    check(run.loaded().layers[0].fusedGateUp.isInt8Blocks());
+    check(run.loaded().layers[0].down.isInt8Blocks());
+    check(!run.loaded().layers[0].inputNorm.isInt8Blocks());
 
     auto worst = checkStepAgainstReference(
-        prompt.step(tokens), expected, shape, 0, (int) tokens.size());
+        run.step(tokens), expected, shape, 0, (int) tokens.size());
 
-    auto cached = DecoderRun {shape, checkpoint.weights()};
+    run.beginSequence();
 
     for (auto index = 0; index < (int) tokens.size(); ++index)
     {
-        const auto result = cached.step({tokens[(std::size_t) index]});
+        const auto result = run.step({tokens[(std::size_t) index]});
 
         worst = std::max(
             worst, checkStepAgainstReference(result, expected, shape, index, 1));
     }
 
-    std::cout << "  bf16 checkpoint: worst error " << worst << "\n";
+    std::cout << "  int8 checkpoint: worst error " << worst << "\n";
 };

@@ -108,9 +108,10 @@ auto tTheTwoGelusAreDifferentFunctions =
 // argument grows as the cube of the input, so an activation of 30 asks tanh
 // for 990 — and Metal's tanh, under the compile options eacp builds a library
 // with, answers that with a NaN rather than with one. Every input at or past
-// 30 came back as not-a-number before Gelu.h clamped the argument. A
-// transformer's activations do reach 30, and one NaN in the residual stream is
-// the whole rest of the sequence, so this case is not a corner.
+// 30 came back as not-a-number before the argument was clamped: by hand in
+// Gelu.h at first, and by eacp's saturatingTanh since. A transformer's
+// activations do reach 30, and one NaN in the residual stream is the whole
+// rest of the sequence, so this case is not a corner.
 auto tGeluTailsStayFinite = test("Kernels/geluTailsStayFinite") = []
 {
     if (!Device::shared().isValid())

@@ -120,23 +120,26 @@ auto tFusedGateUpIsGateThenUp = test("Decoder/fusedGateUpIsGateThenUp") = []
     }
 };
 
-// A checkpoint in Gemma's own storage: every weight reaches the device packed,
-// the norm scales are widened because RMSNorm subscripts floats, and the
-// buffers are half the bytes their widened selves would be.
+// A BF16 checkpoint, which is what google/gemma-2b ships: every weight a
+// product or the gather reads stays packed, at half the bytes the widened path
+// uploaded, and the two norm scales are widened because RMSNorm subscripts
+// floats. The embedding is the one to watch — it is bound to both the gather
+// and the tied logits projection, so a packed one is 1.05 GB in the real model
+// instead of 2.10 GB.
 auto tBFloat16WeightsStayPacked = test("Decoder/bfloat16WeightsStayPacked") = []
 {
     if (!Device::shared().isValid())
         return;
 
     const auto checkpoint =
-        SyntheticCheckpoint {"decoder-bfloat16-weights", TensorType::BF16};
+        SyntheticCheckpoint {"decoder-bf16-weights", Sharding::Single, asBFloat16()};
 
     const auto shape = checkpoint.shape();
     const auto weights = DecoderWeights {checkpoint.weights(), shape};
 
     check(weights.tokenEmbedding.isPackedBFloat16());
     check(weights.tokenEmbedding.buffer.size()
-          == shape.vocabularySize * shape.width * 2);
+          == 2 * shape.vocabularySize * shape.width);
 
     check(!weights.finalNorm.isPackedBFloat16());
     check(bufferElements(weights.finalNorm) == shape.width);
@@ -148,41 +151,38 @@ auto tBFloat16WeightsStayPacked = test("Decoder/bfloat16WeightsStayPacked") = []
         check(layer.value.isPackedBFloat16());
         check(layer.output.isPackedBFloat16());
         check(layer.down.isPackedBFloat16());
-        check(layer.fusedGateUp.isPackedBFloat16());
 
         check(!layer.inputNorm.isPackedBFloat16());
         check(!layer.postAttentionNorm.isPackedBFloat16());
+        check(bufferElements(layer.inputNorm) == shape.width);
 
-        check(layer.down.buffer.size() == shape.width * shape.intermediate * 2);
+        check(layer.query.buffer.size() == 2 * shape.queryWidth() * shape.width);
     }
 };
 
-// The stacking done on the packed bytes rather than through a widening — the
-// whole point of gap 1 for this tensor, since gate and up are the largest
-// weights in a layer. Read back as the words they are and widened here, so a
-// stack that shifted the up rows by a half-word, or joined them in the wrong
-// order, fails.
-auto tPackedFusedGateUpIsGateThenUp =
-    test("Decoder/packedFusedGateUpIsGateThenUp") = []
+// The stacking with the bytes left packed, which is what makes the fused
+// gate-and-up weight half what a widened concatenation cost: the buffer is
+// bf16, it is twice one half's bytes, and widening it back gives the gate rows
+// and then the up rows exactly as the checkpoint rounded them.
+auto tBFloat16FusedGateUpStaysPacked =
+    test("Decoder/bfloat16FusedGateUpStaysPacked") = []
 {
     if (!Device::shared().isValid())
         return;
 
     const auto checkpoint =
-        SyntheticCheckpoint {"decoder-fused-bfloat16", TensorType::BF16};
+        SyntheticCheckpoint {"decoder-bf16-fused", Sharding::Single, asBFloat16()};
 
     const auto shape = checkpoint.shape();
     const auto weights = DecoderWeights {checkpoint.weights(), shape};
-
-    const auto halfCount = shape.intermediate * shape.width;
     const auto& fused = weights.layers[0].fusedGateUp;
 
-    check(fused.isPackedBFloat16());
-    check(fused.buffer.size() == 2 * halfCount * 2);
+    const auto halfCount = shape.intermediate * shape.width;
 
-    auto packed = Vector<std::uint16_t> {};
-    packed.resize(2 * halfCount);
-    fused.buffer.read(packed.data(), fused.buffer.size());
+    check(fused.isPackedBFloat16());
+    check(fused.buffer.size() == 2 * 2 * halfCount);
+
+    const auto stacked = readBackBFloat16(fused.buffer, 2 * halfCount);
 
     const auto gate = checkpoint.weights().readFloats(
         GemmaTensors::layerTensorName(0, GemmaTensors::gateProjection));
@@ -191,8 +191,8 @@ auto tPackedFusedGateUpIsGateThenUp =
 
     for (auto index = 0; index < halfCount; ++index)
     {
-        check(bfloat16ToFloat(packed[index]) == gate[index]);
-        check(bfloat16ToFloat(packed[halfCount + index]) == up[index]);
+        check(stacked[index] == gate[index]);
+        check(stacked[halfCount + index] == up[index]);
     }
 };
 
@@ -290,7 +290,7 @@ auto tShapeMismatchIsRefused = test("Decoder/weightsForAnotherShapeAreRefused") 
     other.maxPositions -= 1;
 
     auto decoder = Decoder {other};
-    decoder.prepare();
+    decoder.prepare(weights);
 
     const auto tokens = storageOf(Vector<std::uint32_t> {1u});
     const auto logits = outputFor(shape.logitElementCount());
@@ -332,4 +332,117 @@ auto tUnpreparedStepIsAnError = test("Decoder/unpreparedStepIsAnError") = []
         check(throwsModelError([&]
                                { decoder.step(pass, tokens, 1, weights, logits); }));
     }
+};
+
+// The quantized upload: every tensor a product or the gather reads becomes int8
+// blocks, the two norm scales stay F32 floats, and the buffers are the size the
+// layout says — one byte an element plus one fp16 scale per thirty-two, which
+// at the real model's [256000, 2048] embedding is 557 MB rather than 1.05 GB.
+//
+// The bytes themselves are checked against the dequantizer rather than trusted:
+// the fused gate-and-up weight read back through it has to be the gate rows and
+// then the up rows, quantized, which is the same claim the bf16 stacking test
+// makes about a stack of packed bytes.
+auto tInt8WeightsQuantizeOnUpload = test("Decoder/int8WeightsQuantizeOnUpload") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint = SyntheticCheckpoint {"decoder-int8-weights",
+                                                 Sharding::Single,
+                                                 asBFloat16(),
+                                                 smallQuantizableGemmaConfig()};
+
+    const auto shape = checkpoint.shape();
+    const auto weights =
+        DecoderWeights {checkpoint.weights(), shape, WeightPrecision::Int8Blocks};
+
+    const auto quantizedBytes = [](int elements)
+    { return (int) int8BlocksByteCount(elements); };
+
+    check(weights.tokenEmbedding.isInt8Blocks());
+    check(weights.tokenEmbedding.buffer.size()
+          == quantizedBytes(shape.vocabularySize * shape.width));
+
+    check(!weights.finalNorm.isInt8Blocks());
+    check(bufferElements(weights.finalNorm) == shape.width);
+
+    for (const auto& layer: weights.layers)
+    {
+        check(layer.query.isInt8Blocks());
+        check(layer.key.isInt8Blocks());
+        check(layer.value.isInt8Blocks());
+        check(layer.output.isInt8Blocks());
+        check(layer.down.isInt8Blocks());
+        check(layer.fusedGateUp.isInt8Blocks());
+
+        check(!layer.inputNorm.isInt8Blocks());
+        check(!layer.postAttentionNorm.isInt8Blocks());
+
+        check(layer.query.buffer.size()
+              == quantizedBytes(shape.queryWidth() * shape.width));
+    }
+
+    const auto storages = weights.storages();
+
+    check(storages.size() == 1);
+    check(storages[0] == WeightStorage::Int8Blocks);
+
+    const auto halfCount = shape.intermediate * shape.width;
+    const auto& fused = weights.layers[0].fusedGateUp;
+
+    check(fused.buffer.size() == quantizedBytes(2 * halfCount));
+
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize(fused.buffer.size());
+    fused.buffer.read(bytes.data(), bytes.size());
+
+    auto stacked = sized(2 * halfCount);
+    dequantizeInt8Blocks(Span<const std::uint8_t> {bytes.data(), bytes.size()},
+                         Span<float> {stacked.data(), stacked.size()});
+
+    auto expectedHalf = [&](std::string_view suffix)
+    {
+        auto values = checkpoint.weights().readFloats(
+            GemmaTensors::layerTensorName(0, suffix));
+
+        auto widened = Vector<float> {};
+        TiledProduct::quantizedInt8Blocks(values, widened);
+
+        return widened;
+    };
+
+    const auto gate = expectedHalf(GemmaTensors::gateProjection);
+    const auto up = expectedHalf(GemmaTensors::upProjection);
+
+    for (auto index = 0; index < halfCount; ++index)
+    {
+        check(stacked[index] == gate[index]);
+        check(stacked[halfCount + index] == up[index]);
+    }
+};
+
+// The shape the block format cannot hold, refused by name rather than stored at
+// a layout the shader would read differently. The suite's own 48-wide
+// feed-forward is exactly that shape, which is why the quantized tiers run at
+// 64 — so this is the one test that wants the ordinary small config.
+auto tUnquantizableShapeIsAnError = test("Decoder/unquantizableShapeIsAnError") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto checkpoint =
+        SyntheticCheckpoint {"decoder-int8-refused", Sharding::Single, asBFloat16()};
+
+    const auto shape = checkpoint.shape();
+
+    check(!quantizesAsInt8Blocks(shape.intermediate,
+                                 shape.width * shape.intermediate));
+
+    check(throwsModelError(
+        [&]
+        {
+            return DecoderWeights {
+                checkpoint.weights(), shape, WeightPrecision::Int8Blocks};
+        }));
 };

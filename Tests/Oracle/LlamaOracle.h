@@ -4,16 +4,16 @@
 // vocabulary that hangs off the model, freed in that order whatever a test
 // does with them.
 //
-// What it reads is gemma-2b.gguf, the F32 conversion google/gemma-2b ships
-// beside the safetensors. F32 on both sides is what makes this tier worth a
+// What it reads is gemma-2b.gguf, the F32 conversion of the same safetensors
+// the build fetches. F32 on both sides is what makes this tier worth a
 // dependency — the reference holds the same weights at the same width, so a
 // logit that disagrees is arithmetic of ours rather than a conversion, which
 // is not a claim the fp16 GGML files most models ship can support.
 //
 // Everything skips on a missing file, the same shape as a GPU test returning
 // early when Device::shared().isValid() is false: the GGUF is 10 GB, and the
-// ungated mirror the build fetches has no copy of it, so it is a manual
-// download out of Google's own gated repo and never a commit.
+// mirror the build fetches has no copy of it, so it is converted by hand out
+// of the safetensors and never a commit.
 
 #include <HuggingFaceEACP/Core/Core.h>
 #include <HuggingFaceEACP/Tokenizer/SpecialTokens.h>

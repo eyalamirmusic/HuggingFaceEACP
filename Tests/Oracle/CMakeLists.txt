@@ -3,8 +3,8 @@
 # which is also where llama.cpp itself is fetched, with every backend off so
 # the reference is exactly ggml's CPU arithmetic.
 #
-# What it reads is gemma-2b.gguf, the F32 conversion the model repo ships
-# beside the safetensors — the same weights at the same width, which is what
+# What it reads is gemma-2b.gguf, the F32 conversion of the same safetensors
+# the build fetches — the same weights at the same width, which is what
 # makes a logit comparison mean something rather than measuring a quantisation.
 if (NOT HF_EACP_ENABLE_LLAMA_CPP)
     return()

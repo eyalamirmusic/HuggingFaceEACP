@@ -73,7 +73,7 @@ auto tGemmaPromptRuns = test("Decoder/Gemma/promptRunsAndIsFinite") = []
 
     const auto weights = DecoderWeights {weightFile, shape};
     auto decoder = Decoder {shape};
-    decoder.prepare();
+    decoder.prepare(weights);
 
     const auto tokens = smokeTokens();
     const auto rowCount = (int) tokens.size();
@@ -146,7 +146,7 @@ auto tGemmaStepCapacityIsEnforced = test("Decoder/Gemma/stepCapacityIsEnforced")
         DecoderWeights {ShardedTensors::fromModelFiles(files), shape};
 
     auto decoder = Decoder {shape};
-    decoder.prepare();
+    decoder.prepare(weights);
 
     const auto rows = smokeStepRows + 1;
     const auto tokens = storageOf(unsignedSized(rows));
