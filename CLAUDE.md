@@ -86,10 +86,8 @@ ctest --test-dir build --output-on-failure
 
   It costs disk twice over. The download itself is 5.0 GB of
   `model.safetensors` plus 17.5 MB of `tokenizer.json` and under a kilobyte of
-  the two JSON configs, and it lands in `build/_deps` — set `CPM_SOURCE_CACHE`
-  to a directory outside the build tree and every build directory on the
-  machine shares one copy instead of re-downloading 5 GB each. On top of that
-  each `hf_bundle_model` target gets a **copy**, not a link, so `Generate` and
+  the two JSON configs, and it lands in `build/_deps`. On top of that each
+  `hf_bundle_model` target gets a **copy**, not a link, so `Generate` and
   `BundledTests` are 5 GB apiece beside their executables — about 15 GB for a
   full build tree. Configure with `-DHF_EACP_FETCH_MODEL=OFF` for a build that
   only wants the library; the tests that need a checkpoint then skip the way a
